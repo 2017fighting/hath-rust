@@ -291,6 +291,55 @@ The program will now terminate.
         }
     }
 
+    /// Fetch the current client settings the server has on record, as an owned
+    /// key=value map. Used by the natmap port-sync flow to read the registered
+    /// port and preserve the other settings when updating it.
+    pub async fn fetch_client_settings(&self) -> Option<HashMap<String, String>> {
+        match self.send_action("client_settings", None).await {
+            Ok(res) if res.is_ok() => Some(res.to_map().into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()),
+            Ok(res) => {
+                warn!("client_settings returned non-OK: {}", res.status);
+                None
+            }
+            Err(err) => {
+                error!("client_settings request failed: {}", err);
+                None
+            }
+        }
+    }
+
+    /// Tell the server to suspend this client. The natmap port-sync flow calls
+    /// this before updating the registered port on the web settings page, as
+    /// the server rejects settings changes while a client is active.
+    pub async fn suspend(&self) {
+        match self.send_action("client_suspend", None).await {
+            Ok(res) if res.is_ok() => info!("Client suspended"),
+            Ok(res) => warn!("client_suspend returned non-OK: {}", res.status),
+            Err(err) => error!("client_suspend request failed: {}", err),
+        }
+    }
+
+    /// Re-notify the server that the client has started, so it re-runs its
+    /// connectivity test against the (possibly changed) registered port.
+    /// Returns false on failure; the caller logs and retries next cycle rather
+    /// than tearing down the running client.
+    pub async fn client_start(&self) -> bool {
+        match self.send_action("client_start", None).await {
+            Ok(res) if res.is_ok() => {
+                info!("Client start notified");
+                true
+            }
+            Ok(res) => {
+                warn!("client_start returned non-OK: {}", res.status);
+                false
+            }
+            Err(err) => {
+                error!("client_start request failed: {}", err);
+                false
+            }
+        }
+    }
+
     pub fn is_vaild_rpc_server(&self, ip: &str) -> bool {
         self.settings.disable_ip_check || self.rpc_servers.read().iter().any(|s| s == ip)
     }
