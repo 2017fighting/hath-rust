@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+# Minimal static image around the musl build of hath-rust.
+#
+# Build the static binary on the host first:
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo zigbuild --release --target x86_64-unknown-linux-musl
+#
+# Then build the image:
+#   docker build -f Dockerfile.static -t hath-rust:natmap-sync .
+#
+# The binary is fully static (musl), so the alpine base only needs CA roots for
+# the outgoing HTTPS calls to the tracker / settings page. WORKDIR /hath makes
+# the default cache/data/log/tmp/download dirs land under /hath/* to match the
+# NFS mounts in the HelmRelease.
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+WORKDIR /hath
+COPY target/x86_64-unknown-linux-musl/release/hath-rust /usr/local/bin/hath-rust
+ENTRYPOINT ["hath-rust"]
