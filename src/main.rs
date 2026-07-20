@@ -315,6 +315,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let server_handle = server.handle();
 
+    // Optional NAT port-sync (pre-startup): reconcile the registered port with
+    // the external port published by natmap BEFORE notifying the server of
+    // startup, so the connectivity test in connect_check runs against the
+    // correct port. Blocks startup until the registered port matches, retrying
+    // with backoff on any failure. The same instance is reused for the
+    // background poll loop below.
+    let natmap_sync = match &natmap_config {
+        Some(config) => {
+            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone());
+            sync.sync_until_ready().await;
+            Some(sync)
+        }
+        None => None,
+    };
+
     info!("Notifying the server that we have finished starting up the client...");
     if client.connect_check(init_settings).await.is_none() {
         error!("Startup notification failed.");
@@ -334,24 +349,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("H@H initialization completed successfully. Starting normal operation");
 
-    // Optional NAT port-sync: keeps the tracker's recorded port in sync with the
-    // external port published by natmap. Spawned only when fully configured.
-    let natmap_handle = match natmap_config {
-        Some(config) => {
+    // Background poll loop. Reuses the NatmapSync instance built before
+    // connect_check; `natmap_config` is still in scope to log the config.
+    let natmap_handle = match (&natmap_config, natmap_sync) {
+        (Some(config), Some(sync)) => {
             info!("Starting natmap port-sync (instance={}, interval={}s)", config.instance, config.poll_interval.as_secs());
-            let natmap_client = client.clone();
-            let natmap_metrics = metrics.clone();
             Some(tokio::spawn(async move {
-                NatmapSync::new(config, natmap_client, natmap_metrics).run().await;
+                sync.run().await;
             }))
         }
-        None => {
+        (None, None) => {
             info!(
                 "natmap port-sync disabled (set --natmap-api-endpoint, --natmap-instance, \
                  --ipb-member-id and --ipb-pass-hash to enable)"
             );
             None
         }
+        // natmap_sync is Some iff natmap_config is Some (both built together above).
+        _ => unreachable!("natmap_sync and natmap_config must agree"),
     };
 
     // Command listener

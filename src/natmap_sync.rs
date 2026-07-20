@@ -20,7 +20,7 @@ use reqwest::{
     header::{CONTENT_TYPE, COOKIE},
 };
 use serde::Deserialize;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use crate::{
     metrics::{LABEL_NATMAP_SYNC_APPLIED, LABEL_NATMAP_SYNC_ERROR, LABEL_NATMAP_SYNC_NO_CHANGE, Metrics},
@@ -31,6 +31,12 @@ use crate::{
 /// Central settings page. The `cid` query parameter is the H@H Client ID,
 /// sourced at runtime from `RPCClient::id` rather than hardcoded.
 const SETTINGS_URL: &str = "https://e-hentai.org/hentaiathome.php";
+
+/// Initial delay before the first pre-startup retry. Doubles each attempt,
+/// up to `STARTUP_SYNC_MAX`.
+const STARTUP_SYNC_INITIAL: Duration = Duration::from_secs(5);
+/// Upper bound for the pre-startup retry backoff.
+const STARTUP_SYNC_MAX: Duration = Duration::from_secs(300);
 
 /// All configuration the port-sync task needs. When any field is unset at
 /// startup the task is not spawned, so this feature is purely opt-in.
@@ -123,6 +129,20 @@ pub struct NatmapSync {
     metrics: Arc<Metrics>,
 }
 
+/// Outcome of a single reconciliation pass. `reconcile_once` does not call
+/// `client_start` itself — the caller decides whether a re-notify is needed
+/// (the background loop does; the pre-startup sync does not, since
+/// `connect_check` runs next).
+enum ReconcileResult {
+    /// Registered port already matched the external port; nothing changed.
+    NoChange,
+    /// Registered port differed and was updated successfully.
+    Applied,
+    /// The pass did not complete (natmap unreachable, settings fetch failed,
+    /// or the settings POST was rejected). Retryable.
+    Failed,
+}
+
 impl NatmapSync {
     pub fn new(config: NatmapConfig, client: Arc<RPCClient>, metrics: Arc<Metrics>) -> Self {
         // Dedicated HTTP client: short timeout, no proxy. The natmap API is on
@@ -150,15 +170,41 @@ impl NatmapSync {
         }
     }
 
-    /// One reconciliation pass.
-    async fn cycle(&self) {
+    /// Run reconciliation passes until one succeeds (`NoChange` or `Applied`),
+    /// retrying with exponential backoff. Called before `connect_check` so the
+    /// client comes online with the correct registered port. Never gives up:
+    /// every failure mode is retried. Does NOT call `client_start` — the
+    /// caller (`connect_check` in main) starts the client next.
+    pub async fn sync_until_ready(&self) {
+        info!("natmap: running pre-startup port-sync...");
+        let mut delay = STARTUP_SYNC_INITIAL;
+        loop {
+            match self.reconcile_once().await {
+                ReconcileResult::NoChange | ReconcileResult::Applied => break,
+                ReconcileResult::Failed => {
+                    warn!(
+                        "natmap: pre-startup sync did not complete; retrying in {:?}",
+                        delay
+                    );
+                    sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(STARTUP_SYNC_MAX);
+                }
+            }
+        }
+        info!("natmap: pre-startup port-sync complete");
+    }
+
+    /// One reconciliation pass. Reads the live NAT mapping and the tracker's
+    /// registered port; if they differ, suspends and updates the settings
+    /// page. Does NOT call `client_start` — the caller decides.
+    async fn reconcile_once(&self) -> ReconcileResult {
         // 1. Read the live NAT mapping.
         let mapping = match self.fetch_natmap().await {
             Some(mapping) => mapping,
             None => {
                 warn!("natmap: instance `{}` not registered or unreachable; skipping", self.config.instance);
                 self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-                return;
+                return ReconcileResult::Failed;
             }
         };
         self.metrics.natmap_port.set(mapping.port as u64);
@@ -168,7 +214,7 @@ impl NatmapSync {
             Some(map) => map,
             None => {
                 self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-                return;
+                return ReconcileResult::Failed;
             }
         };
         let registered_port = map.get("port").and_then(|v| v.parse::<u16>().ok());
@@ -182,10 +228,10 @@ impl NatmapSync {
         if registered_port == Some(mapping.port) {
             info!("natmap: external port {} matches registered port; no change", mapping.port);
             self.inc_sync(LABEL_NATMAP_SYNC_NO_CHANGE);
-            return;
+            return ReconcileResult::NoChange;
         }
 
-        // 4. Differ → suspend, update the settings page, re-notify start.
+        // 4. Differ → suspend, update the settings page.
         info!(
             "natmap: external port {} differs from registered port {}; updating",
             mapping.port,
@@ -194,20 +240,29 @@ impl NatmapSync {
         let settings = HathWebSettings::from_settings_map(&map, mapping.port);
 
         // The settings page rejects changes while the client is active, so the
-        // order is mandatory: suspend first, then POST.
+        // order is mandatory: suspend first, then POST. Pre-startup this also
+        // clears a stale server-side session from an unclean shutdown.
         self.client.suspend().await;
         if !self.update_port(&settings).await {
-            // POST failed: leave the client suspended and let the next cycle
-            // retry, matching the sidecar's behavior. The RPC client itself
-            // stays alive (is_running is untouched).
-            error!("natmap: settings page update failed; will retry next cycle");
+            // POST failed: leave the client suspended and let the caller retry.
+            // The RPC client itself stays alive (is_running is untouched).
+            error!("natmap: settings page update failed; will retry");
             self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-            return;
+            return ReconcileResult::Failed;
         }
-        self.client.client_start().await;
         self.metrics.natmap_registered_port.set(mapping.port as u64);
         self.inc_sync(LABEL_NATMAP_SYNC_APPLIED);
         info!("natmap: registered port updated to {}", mapping.port);
+        ReconcileResult::Applied
+    }
+
+    /// One reconciliation pass followed by a re-notify-start when the port was
+    /// changed. Used by the background poll loop.
+    async fn cycle(&self) {
+        if matches!(self.reconcile_once().await, ReconcileResult::Applied) {
+            // We suspended an active client to update its port; bring it back.
+            self.client.client_start().await;
+        }
     }
 
     /// GET `<api_endpoint>/<instance>.json`. Returns `None` on 404 (instance not
