@@ -12,7 +12,7 @@
 //! reusing `RPCClient` for the RPC actions and adding only the router poll and
 //! the web-settings POST.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
 use log::{error, info, warn};
 use reqwest::{
@@ -148,6 +148,9 @@ impl NatmapSync {
         // Dedicated HTTP client: short timeout. Uses the same proxy config as
         // the rest of the client so e-hentai.org settings POST goes through the
         // user's proxy/VPN when configured.
+        if proxy.is_some() {
+            info!("natmap: using proxy for e-hentai settings POST");
+        }
         let http = create_http_client(Duration::from_secs(10), proxy);
         Self {
             config,
@@ -327,7 +330,12 @@ impl NatmapSync {
                 }
             }
             Err(err) => {
-                error!("natmap: settings POST failed: {err:#}");
+                error!("natmap: settings POST failed: {err}");
+                let mut source = err.source();
+                while let Some(s) = source {
+                    error!("  caused by: {s}");
+                    source = s.source();
+                }
                 false
             }
         }
