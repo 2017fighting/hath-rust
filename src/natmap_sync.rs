@@ -125,7 +125,10 @@ impl HathWebSettings {
 pub struct NatmapSync {
     config: NatmapConfig,
     client: Arc<RPCClient>,
+    /// No-proxy client (LAN natmap API fetch).
     http: Client,
+    /// Proxy-enabled client (e-hentai.org settings POST).
+    http_proxy: Client,
     metrics: Arc<Metrics>,
 }
 
@@ -145,17 +148,19 @@ enum ReconcileResult {
 
 impl NatmapSync {
     pub fn new(config: NatmapConfig, client: Arc<RPCClient>, metrics: Arc<Metrics>, proxy: Option<Proxy>) -> Self {
-        // Dedicated HTTP client: short timeout. Uses the same proxy config as
-        // the rest of the client so e-hentai.org settings POST goes through the
-        // user's proxy/VPN when configured.
+        // Two HTTP clients:
+        //   http       – no proxy, for the LAN-only natmap API fetch.
+        //   http_proxy – with proxy (optional), for the e-hentai.org settings POST.
         if proxy.is_some() {
             info!("natmap: using proxy for e-hentai settings POST");
         }
-        let http = create_http_client(Duration::from_secs(10), proxy);
+        let http = create_http_client(Duration::from_secs(10), None);
+        let http_proxy = create_http_client(Duration::from_secs(10), proxy);
         Self {
             config,
             client,
             http,
+            http_proxy,
             metrics,
         }
     }
@@ -304,6 +309,8 @@ impl NatmapSync {
 
     /// POST the new settings to the central settings page. Returns false on any
     /// failure so the caller leaves the client suspended for a next-cycle retry.
+    /// Uses the proxy-enabled client since e-hentai.org requires a proxy/VPN
+    /// from some networks.
     async fn update_port(&self, settings: &HathWebSettings) -> bool {
         let url = format!("{}?cid={}&act=settings", SETTINGS_URL, self.client.id());
         let cookie = format!("ipb_member_id={}; ipb_pass_hash={}", self.config.ipb_member_id, self.config.ipb_pass_hash);
@@ -311,7 +318,7 @@ impl NatmapSync {
         // so RequestBuilder::form(...) is unavailable.
         let body = serde_urlencoded::to_string(settings.to_form()).unwrap_or_default();
         match self
-            .http
+            .http_proxy
             .post(&url)
             .header(COOKIE, cookie)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
