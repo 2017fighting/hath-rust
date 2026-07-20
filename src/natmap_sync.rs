@@ -182,25 +182,39 @@ impl NatmapSync {
     /// Run reconciliation passes until one succeeds (`NoChange` or `Applied`),
     /// retrying with exponential backoff. Called before `connect_check` so the
     /// client comes online with the correct registered port. Never gives up:
-    /// every failure mode is retried. Does NOT call `client_start` — the
-    /// caller (`connect_check` in main) starts the client next.
-    pub async fn sync_until_ready(&self) {
+    /// every failure mode is retried. Responds to Ctrl+C during sleep so the
+    /// process can be interrupted during a stalled retry loop.
+    ///
+    /// Returns `true` when the sync completed successfully, `false` if the
+    /// user interrupted with Ctrl+C before it finished.
+    pub async fn sync_until_ready(&self) -> bool {
         info!("natmap: running pre-startup port-sync...");
         let mut delay = STARTUP_SYNC_INITIAL;
         loop {
             match self.reconcile_once().await {
-                ReconcileResult::NoChange | ReconcileResult::Applied => break,
+                ReconcileResult::NoChange | ReconcileResult::Applied => {
+                    info!("natmap: pre-startup port-sync complete");
+                    return true;
+                }
                 ReconcileResult::Failed => {
                     warn!(
                         "natmap: pre-startup sync did not complete; retrying in {:?}",
                         delay
                     );
-                    sleep(delay).await;
+                    let interrupted = tokio::select! {
+                        _ = sleep(delay) => false,
+                        _ = tokio::signal::ctrl_c() => {
+                            info!("natmap: pre-startup sync interrupted by Ctrl+C");
+                            true
+                        }
+                    };
+                    if interrupted {
+                        return false;
+                    }
                     delay = delay.saturating_mul(2).min(STARTUP_SYNC_MAX);
                 }
             }
         }
-        info!("natmap: pre-startup port-sync complete");
     }
 
     /// One reconciliation pass. Reads the live NAT mapping and the tracker's
