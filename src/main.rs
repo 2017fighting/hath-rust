@@ -323,7 +323,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // background poll loop below.
     let natmap_sync = match &natmap_config {
         Some(config) => {
-            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone());
+            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone());
             sync.sync_until_ready().await;
             Some(sync)
         }

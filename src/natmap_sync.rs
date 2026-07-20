@@ -16,7 +16,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use log::{error, info, warn};
 use reqwest::{
-    Client,
+    Client, Proxy,
     header::{CONTENT_TYPE, COOKIE},
 };
 use serde::Deserialize;
@@ -144,10 +144,11 @@ enum ReconcileResult {
 }
 
 impl NatmapSync {
-    pub fn new(config: NatmapConfig, client: Arc<RPCClient>, metrics: Arc<Metrics>) -> Self {
-        // Dedicated HTTP client: short timeout, no proxy. The natmap API is on
-        // the LAN and the settings page is reached directly from a no-proxy node.
-        let http = create_http_client(Duration::from_secs(10), None);
+    pub fn new(config: NatmapConfig, client: Arc<RPCClient>, metrics: Arc<Metrics>, proxy: Option<Proxy>) -> Self {
+        // Dedicated HTTP client: short timeout. Uses the same proxy config as
+        // the rest of the client so e-hentai.org settings POST goes through the
+        // user's proxy/VPN when configured.
+        let http = create_http_client(Duration::from_secs(10), proxy);
         Self {
             config,
             client,
@@ -326,7 +327,7 @@ impl NatmapSync {
                 }
             }
             Err(err) => {
-                error!("natmap: settings POST failed: {}", err);
+                error!("natmap: settings POST failed: {err:#}");
                 false
             }
         }
