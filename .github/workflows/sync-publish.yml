@@ -13,11 +13,11 @@ name: Sync and Publish
 
 on:
   schedule:
-    - cron: '17 3 * * *' # daily 03:17 UTC
+    - cron: "17 3 * * *" # daily 03:17 UTC
   workflow_dispatch:
     inputs:
       force:
-        description: 'Publish even if nothing changed (e.g. to pick up base image updates)'
+        description: "Publish even if nothing changed (e.g. to pick up base image updates)"
         type: boolean
         default: false
 
@@ -126,7 +126,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"]
+        target:
+          [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "armv7-unknown-linux-gnueabihf",
+          ]
     steps:
       - uses: actions/checkout@v6
         with:
