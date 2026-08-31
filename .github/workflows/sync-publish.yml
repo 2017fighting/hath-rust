@@ -1,0 +1,275 @@
+name: Sync and Publish
+
+# Daily end-to-end pipeline for this fork:
+#   1. Merge upstream/main (james58899/hath-rust) into feat/natmap-sync
+#   2. On merge conflict: open/comment a tracking issue and stop
+#   3. Build linux-gnu targets from the merged commit (not the event SHA)
+#   4. Publish multi-arch images to ghcr.io: latest + date tag
+#
+# Why the build matrix is inlined instead of reusing build.yml:
+#   - a reusable workflow checks out the event-time SHA, which predates the
+#     merge pushed during this run, so images would silently miss the sync
+#   - editing build.yml would conflict with upstream every few months
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # daily 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Publish even if nothing changed (e.g. to pick up base image updates)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-publish
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      issues: write
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      date: ${{ steps.check.outputs.date }}
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: feat/natmap-sync
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/james58899/hath-rust.git
+          git fetch --no-tags upstream main
+
+      - name: Check for changes
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE="$(git merge-base HEAD upstream/main)"
+          TIP="$(git rev-parse upstream/main)"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          FORCE="${{ inputs.force }}"
+          [ -n "$FORCE" ] || FORCE="false"
+          # Tip of this branch when the last successful run started.
+          LAST_TIP="$(gh run list --workflow=sync-publish.yml --status=success --limit=1 --json headSha --jq 'if length > 0 then .[0].headSha else "" end' 2>/dev/null || true)"
+          PUBLISH="false"
+          REASON="no changes since the last successful run"
+          if [ "$FORCE" = "true" ]; then
+            PUBLISH="true"; REASON="forced"
+          elif [ "$BASE" != "$TIP" ]; then
+            PUBLISH="true"; REASON="upstream has new commits"
+          elif [ -z "$LAST_TIP" ] || [ "$LAST_TIP" != "$HEAD_SHA" ]; then
+            PUBLISH="true"; REASON="branch changed since the last run"
+          fi
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH ($REASON)"
+
+      - name: Merge upstream/main
+        id: merge
+        if: steps.check.outputs.publish == 'true'
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git merge upstream/main --no-edit; then
+            echo "::error::Merge conflict merging upstream/main into feat/natmap-sync"
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Report merge conflict
+        if: steps.merge.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="upstream sync blocked: merge conflict"
+          URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          ISSUE="$(gh issue list --state open --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+          if [ -n "$ISSUE" ]; then
+            echo "Commenting on existing issue #$ISSUE"
+            gh issue comment "$ISSUE" --body "Automatic sync is still blocked by merge conflicts: $URL"
+          else
+            gh issue create --title "$TITLE" --body "Automatic daily sync of upstream \`main\` (james58899/hath-rust) into \`feat/natmap-sync\` failed with merge conflicts: $URL
+
+          Resolve manually, then close this issue; automatic publishing resumes on the next scheduled run:
+          \`\`\`bash
+          git fetch https://github.com/james58899/hath-rust.git main
+          git merge FETCH_HEAD # resolve conflicts
+          git push
+          \`\`\`"
+          fi
+          exit 1
+
+      - name: Push
+        if: steps.merge.outcome == 'success'
+        run: git push origin feat/natmap-sync
+
+  build-linux:
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - name: Install amd64 build tools
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y crossbuild-essential-amd64
+      - name: Install arm build tools
+        if: ${{ matrix.target == 'armv7-unknown-linux-gnueabihf' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y crossbuild-essential-armhf
+      - name: Set Jemalloc page size to 64K for aarch64
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install toolchain
+        run: |
+          rustup update
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "x86_64-linux-gnu-gcc"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNU_EABIHF_LINKER: "arm-linux-gnueabihf-gcc"
+        run: cargo build --verbose --release --target=${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hath-rust-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hath-rust
+
+  Docker:
+    needs: [sync, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Create Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          # syntax=docker/dockerfile:1
+          FROM scratch AS binary-amd64
+          COPY artifacts/hath-rust-x86_64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM scratch AS binary-arm64
+          COPY artifacts/hath-rust-aarch64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM scratch AS binary-arm
+          COPY artifacts/hath-rust-armv7-unknown-linux-gnueabihf/hath-rust /hath-rust
+          FROM binary-$TARGETARCH AS binary
+          FROM debian:trixie-slim
+          WORKDIR /hath
+          COPY --from=binary --chmod=755 /hath-rust /usr/local/bin/hath-rust
+          ENTRYPOINT ["hath-rust"]
+          EOF
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.date }}
+
+  Docker-tiny:
+    needs: [sync, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Create Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          # syntax=docker/dockerfile:1
+          FROM debian:trixie AS binary-amd64
+          RUN cp /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-x86_64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM debian:trixie AS binary-arm64
+          RUN cp /usr/lib/aarch64-linux-gnu/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-aarch64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM debian:trixie AS binary-arm
+          RUN cp /usr/lib/arm-linux-gnueabihf/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-armv7-unknown-linux-gnueabihf/hath-rust /hath-rust
+          FROM binary-$TARGETARCH AS binary
+          FROM busybox:stable-glibc
+          WORKDIR /hath
+          COPY --from=binary /libgcc_s.so.1 /lib/libgcc_s.so.1
+          COPY --from=binary --chmod=755 /hath-rust /usr/local/bin/hath-rust
+          ENTRYPOINT ["hath-rust"]
+          EOF
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest-tiny
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.date }}-tiny
