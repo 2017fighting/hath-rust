@@ -167,7 +167,7 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "x86_64-linux-gnu-gcc"
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNU_EABIHF_LINKER: "arm-linux-gnueabihf-gcc"
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: "arm-linux-gnueabihf-gcc"
         run: cargo build --verbose --release --target=${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
