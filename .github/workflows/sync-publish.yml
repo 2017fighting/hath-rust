@@ -3,8 +3,25 @@ name: Sync and Publish
 # Daily end-to-end pipeline for this fork:
 #   1. Merge upstream/main (james58899/hath-rust) into feat/natmap-sync
 #   2. On merge conflict: open/comment a tracking issue and stop
-#   3. Build linux-gnu targets from the merged commit (not the event SHA)
-#   4. Publish multi-arch images to ghcr.io: latest + date tag
+#   3. Tag the merge commit by patch-bumping the fork's highest vX.Y.Z tag
+#      (v1.19.1 -> v1.19.2), push branch + tag
+#   4. Build linux-gnu targets from the merged commit (not the event SHA)
+#   5. Publish multi-arch images to ghcr.io: {tag} + latest (+ -tiny variants)
+#
+# Versioning: the fork carries its own release line — upstream tags stopped at
+# v1.17.0, Cargo.toml is not bumped per release, and this branch's manually-cut
+# v1.18.x/v1.19.x tags outrun both. "New tag" therefore means: highest existing
+# v-tag with patch+1. Cut a minor/major manually for milestones; the next run
+# continues from whatever is highest. Tag pushes also trigger release.yml
+# (draft GitHub Release with binary artifacts), same as the manual tags did.
+#
+# Retired scheme (2026-09): daily date tags (20260908). They carried no version
+# meaning, flooded the registry daily, and Renovate cannot reason about them —
+# downstream now pins vX.Y.Z and tracks the semver stream only.
+#
+# Own-branch changes without upstream movement do not publish (there is no
+# version bump to hang them on) — use the force input for that, e.g. to pick
+# up base-image updates.
 #
 # Why the build matrix is inlined instead of reusing build.yml:
 #   - a reusable workflow checks out the event-time SHA, which predates the
@@ -34,12 +51,11 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      actions: read
       contents: write
       issues: write
     outputs:
       publish: ${{ steps.check.outputs.publish }}
-      date: ${{ steps.check.outputs.date }}
+      tag: ${{ steps.check.outputs.tag }}
       sha: ${{ steps.merge.outputs.sha }}
     steps:
       - name: Checkout
@@ -57,28 +73,26 @@ jobs:
 
       - name: Check for changes
         id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           BASE="$(git merge-base HEAD upstream/main)"
           TIP="$(git rev-parse upstream/main)"
-          HEAD_SHA="$(git rev-parse HEAD)"
           FORCE="${{ inputs.force }}"
           [ -n "$FORCE" ] || FORCE="false"
-          # Tip of this branch when the last successful run started.
-          LAST_TIP="$(gh run list --workflow=sync-publish.yml --status=success --limit=1 --json headSha --jq 'if length > 0 then .[0].headSha else "" end' 2>/dev/null || true)"
+          # Publish when upstream/main has commits not yet merged here.
           PUBLISH="false"
-          REASON="no changes since the last successful run"
+          REASON="upstream has no new commits"
           if [ "$FORCE" = "true" ]; then
             PUBLISH="true"; REASON="forced"
           elif [ "$BASE" != "$TIP" ]; then
             PUBLISH="true"; REASON="upstream has new commits"
-          elif [ -z "$LAST_TIP" ] || [ "$LAST_TIP" != "$HEAD_SHA" ]; then
-            PUBLISH="true"; REASON="branch changed since the last run"
           fi
+          # Next tag on the fork release line: highest vX.Y.Z with patch+1.
+          # Version sort is numeric-aware (v1.19.1 > v1.10.0 > v1.9.0).
+          TAG="$(git tag --list 'v*' --sort=-v:refname | head -n1)"
+          NEW_TAG="${TAG%.*}.$((${TAG##*.} + 1))"
           echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
-          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH ($REASON)"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH ($REASON), next tag: $NEW_TAG"
 
       - name: Merge upstream/main
         id: merge
@@ -116,9 +130,22 @@ jobs:
           fi
           exit 1
 
-      - name: Push
+      - name: Push branch
         if: steps.merge.outcome == 'success'
         run: git push origin feat/natmap-sync
+
+      - name: Tag and push tag
+        if: steps.merge.outcome == 'success'
+        env:
+          TAG: ${{ steps.check.outputs.tag }}
+          SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag ${TAG} already exists; refusing to move it"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "$TAG" "$SHA"
+          git push origin "refs/tags/${TAG}"
 
   build-linux:
     needs: sync
@@ -224,7 +251,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:latest
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.date }}
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.tag }}
 
   Docker-tiny:
     needs: [sync, build-linux]
@@ -280,4 +307,4 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ env.IMAGE_NAME }}:latest-tiny
-            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.date }}-tiny
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.sync.outputs.tag }}-tiny
