@@ -12,8 +12,10 @@ name: Sync and Publish
 # v1.17.0, Cargo.toml is not bumped per release, and this branch's manually-cut
 # v1.18.x/v1.19.x tags outrun both. "New tag" therefore means: highest existing
 # v-tag with patch+1. Cut a minor/major manually for milestones; the next run
-# continues from whatever is highest. Tag pushes also trigger release.yml
-# (draft GitHub Release with binary artifacts), same as the manual tags did.
+# continues from whatever is highest. Note: the tag is pushed with
+# GITHUB_TOKEN, which never triggers other workflows (recursion guard), so
+# release.yml does NOT run for automated tags — binary Releases stay a
+# manual-tag thing (push a tag yourself and release.yml picks it up).
 #
 # Retired scheme (2026-09): daily date tags (20260908). They carried no version
 # meaning, flooded the registry daily, and Renovate cannot reason about them —
