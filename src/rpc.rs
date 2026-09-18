@@ -48,6 +48,17 @@ pub struct Settings {
     disable_ip_check: bool,
 }
 
+/// Result of a `connect_check` / `client_start` call.
+pub enum ConnectCheckResult {
+    /// Server accepted the startup notification and confirmed connectivity.
+    Ok,
+    /// Server could not reach the client on the registered port (`FAIL_CONNECT_TEST`).
+    /// This is retryable: once the DNAT rule is in place the next attempt will succeed.
+    ConnectTestFail,
+    /// Any other failure (wrong config, duplicate client, etc.). Do not retry.
+    Fatal,
+}
+
 pub struct InitSettings {
     client_port: u16,
     client_host: String,
@@ -223,35 +234,25 @@ impl RPCClient {
         Utc::now().checked_add_signed(offset).unwrap_or_else(Utc::now).timestamp()
     }
 
-    pub async fn connect_check(&self, settings: InitSettings) -> Option<()> {
+    pub async fn connect_check(&self, settings: &InitSettings) -> ConnectCheckResult {
         if let Ok(res) = self.send_action("client_start", None).await {
             if res.is_ok() {
                 self.running.store(true, Ordering::Relaxed);
-                return Some(());
+                return ConnectCheckResult::Ok;
             }
 
             error!("Startup Failure: {}", res.status);
             match res.status {
-                s if s.starts_with("FAIL_CONNECT_TEST") => error!(
-                    r#"
-
-************************************************************************************************************************************
-The client has failed the external connectivity test.
-The server could not connect to the client, which usually means it is not publicly reachable from the internet.
-If you are behind a NAT and/or firewall, check that port {} is open and forwarded to this computer.
-If you need assistance with forwarding a port to this client, locate a guide for your particular router at https://portforward.com/
-You may also want to check that {} matches your public IPv4 address.
-Your outgoing and incoming IP address must be the same; the address above is your current outgoing IP as seen by the server.
-If your setup is using a non-transparent proxy, you may be able to fix this by starting the client with --disable-ip-origin-check
-This is mostly applicable if you are seeing 'Rejecting connection request during startup' errors referencing a local network IP.
-The client will remain running so you can diagnose firewall and port forwarding issues.
-Use Program -> Exit in windowed mode or hit Ctrl+C in console mode to exit the program.
-************************************************************************************************************************************
-
-"#,
-                    settings.client_port(),
-                    settings.client_host()
-                ),
+                s if s.starts_with("FAIL_CONNECT_TEST") => {
+                    warn!(
+                        "The server could not reach port {} (reported host: {}). \
+                         This is expected while DNAT/natmap is not yet ready. \
+                         Will retry once the port becomes reachable.",
+                        settings.client_port(),
+                        settings.client_host()
+                    );
+                    return ConnectCheckResult::ConnectTestFail;
+                }
                 s if s.starts_with("FAIL_OTHER_CLIENT_CONNECTED") => error!(
                     r#"
 
@@ -278,7 +279,7 @@ The program will now terminate.
                 _ => (),
             }
         }
-        None
+        ConnectCheckResult::Fatal
     }
 
     pub async fn refresh_settings(&self) {

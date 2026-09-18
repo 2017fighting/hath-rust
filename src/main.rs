@@ -33,7 +33,7 @@ use crate::{
     logger::Logger,
     metrics::Metrics,
     natmap_sync::{NatmapConfig, NatmapSync},
-    rpc::RPCClient,
+    rpc::{ConnectCheckResult, RPCClient},
     server::{Server, ServerOptions},
     util::{create_dirs, create_http_client},
 };
@@ -334,11 +334,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     info!("Notifying the server that we have finished starting up the client...");
-    if client.connect_check(init_settings).await.is_none() {
-        error!("Startup notification failed.");
-        sleep(Duration::from_secs(5)).await;
-        return Err(error::Error::ConnectTestFail.into());
-    }
+    connect_until_ready(&client, &init_settings).await?;
 
     // Check download jobs
     client.refresh_settings().await;
@@ -486,6 +482,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     cache_manager.save_state().await;
     logger.shutdown().await;
     Ok(())
+}
+
+/// Retry `client_start` until the server confirms connectivity, using
+/// exponential backoff. Only `FAIL_CONNECT_TEST` is retried — any other
+/// failure (duplicate client, wrong config, …) is fatal and returned
+/// immediately so the process can exit cleanly.
+///
+/// DNAT rules applied by natmap take effect almost instantly, so we start
+/// with a short 5 s delay and double up to 60 s.
+async fn connect_until_ready(client: &Arc<RPCClient>, init_settings: &rpc::InitSettings) -> Result<(), Box<dyn Error>> {
+    const INITIAL_DELAY: Duration = Duration::from_secs(5);
+    const MAX_DELAY: Duration = Duration::from_secs(60);
+    let mut delay = INITIAL_DELAY;
+    loop {
+        match client.connect_check(init_settings).await {
+            ConnectCheckResult::Ok => return Ok(()),
+            ConnectCheckResult::Fatal => {
+                error!("Startup notification failed.");
+                sleep(Duration::from_secs(5)).await;
+                return Err(error::Error::ConnectTestFail.into());
+            }
+            ConnectCheckResult::ConnectTestFail => {
+                warn!("connect_check: retrying in {:?}...", delay);
+                let interrupted = tokio::select! {
+                    _ = sleep(delay) => false,
+                    _ = signal::ctrl_c() => {
+                        info!("connect_check: interrupted by Ctrl+C");
+                        true
+                    }
+                };
+                if interrupted {
+                    return Err("connect_check interrupted by Ctrl+C".into());
+                }
+                delay = delay.saturating_mul(2).min(MAX_DELAY);
+            }
+        }
+    }
 }
 
 /**
