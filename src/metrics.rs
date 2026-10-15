@@ -39,6 +39,9 @@ pub struct Metrics {
     pub download_file_count: Counter,
     pub download_size: Counter,
     pub download_duration: Histogram,
+    pub natmap_port: Gauge<u64, AtomicU64>,
+    pub natmap_registered_port: Gauge<u64, AtomicU64>,
+    pub natmap_sync_total: Family<NatmapSyncLabels, Counter>,
 }
 
 impl Metrics {
@@ -85,6 +88,14 @@ impl Metrics {
         registry.register_with_unit("download_size", "Number of bytes downloaded", Bytes, download_size.clone());
         registry.register_with_unit("download_duration", "Histogram of download", Seconds, download_duration.clone());
 
+        // NAT port-sync metrics
+        let natmap_port = Gauge::<u64, AtomicU64>::default();
+        let natmap_registered_port = Gauge::<u64, AtomicU64>::default();
+        let natmap_sync_total = Family::<NatmapSyncLabels, Counter>::default();
+        registry.register("natmap_port", "Last observed external port from natmap", natmap_port.clone());
+        registry.register("natmap_registered_port", "Port the tracker currently has on record", natmap_registered_port.clone());
+        registry.register("natmap_sync_total", "Number of natmap port-sync cycles by outcome", natmap_sync_total.clone());
+
         // Uptime
         registry.register_collector(Box::new(Uptime::new()));
 
@@ -105,6 +116,9 @@ impl Metrics {
             download_file_count,
             download_size,
             download_duration,
+            natmap_port,
+            natmap_registered_port,
+            natmap_sync_total,
         }
     }
 }
@@ -119,6 +133,31 @@ enum CacheFetchPhase {
     FetchUrl,
     Download,
 }
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+pub struct NatmapSyncLabels {
+    pub outcome: NatmapSyncOutcome,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelValue)]
+pub enum NatmapSyncOutcome {
+    /// Port was changed on the tracker.
+    Applied,
+    /// Natmap port already matched the registered port; nothing to do.
+    NoChange,
+    /// The cycle errored before it could apply a change.
+    Error,
+}
+
+pub const LABEL_NATMAP_SYNC_APPLIED: NatmapSyncLabels = NatmapSyncLabels {
+    outcome: NatmapSyncOutcome::Applied,
+};
+pub const LABEL_NATMAP_SYNC_NO_CHANGE: NatmapSyncLabels = NatmapSyncLabels {
+    outcome: NatmapSyncOutcome::NoChange,
+};
+pub const LABEL_NATMAP_SYNC_ERROR: NatmapSyncLabels = NatmapSyncLabels {
+    outcome: NatmapSyncOutcome::Error,
+};
 
 #[derive(Debug)]
 struct Uptime {
