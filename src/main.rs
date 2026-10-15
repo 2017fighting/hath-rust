@@ -32,7 +32,8 @@ use crate::{
     gallery_downloader::GalleryDownloader,
     logger::Logger,
     metrics::Metrics,
-    rpc::RPCClient,
+    natmap_sync::{NatmapConfig, NatmapSync},
+    rpc::{ConnectCheckResult, RPCClient},
     server::{Server, ServerOptions},
     util::{create_dirs, create_http_client},
 };
@@ -44,6 +45,7 @@ mod gallery_downloader;
 mod logger;
 mod metrics;
 mod middleware;
+mod natmap_sync;
 mod route;
 mod rpc;
 mod server;
@@ -148,6 +150,32 @@ struct Args {
     /// Experimental HTTP3
     #[arg(long, default_value_t = false)]
     enable_h3: bool,
+
+    /// Base URL of the router-side natmap API, e.g. http://192.168.9.1/natmap.
+    /// Also via HATH_NATMAP_API_ENDPOINT. When any natmap-sync field is unset,
+    /// port-sync stays disabled.
+    #[arg(long, env = "HATH_NATMAP_API_ENDPOINT")]
+    natmap_api_endpoint: Option<String>,
+
+    /// natmap instance id; its mapping is fetched from <api_endpoint>/<instance>.json.
+    /// Also via HATH_NATMAP_INSTANCE.
+    #[arg(long, env = "HATH_NATMAP_INSTANCE")]
+    natmap_instance: Option<String>,
+
+    /// Forum cookie ipb_member_id used to authenticate the settings POST.
+    /// Also via HATH_IPB_MEMBER_ID.
+    #[arg(long, env = "HATH_IPB_MEMBER_ID")]
+    ipb_member_id: Option<String>,
+
+    /// Forum cookie ipb_pass_hash used to authenticate the settings POST.
+    /// Also via HATH_IPB_PASS_HASH.
+    #[arg(long, env = "HATH_IPB_PASS_HASH")]
+    ipb_pass_hash: Option<String>,
+
+    /// natmap poll interval in seconds.
+    /// Also via HATH_NATMAP_POLL_INTERVAL.
+    #[arg(long, env = "HATH_NATMAP_POLL_INTERVAL", default_value_t = 60)]
+    natmap_poll_interval: u64,
 }
 
 type DownloadState = Mutex<HashMap<[u8; 20], (watch::Receiver<Option<Arc<TempPath>>>, Arc<watch::Sender<u64>>)>>;
@@ -189,6 +217,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         std::process::exit(err.exit_code());
     }
     let args = args.unwrap();
+
+    // Extract the natmap port-sync config early, before individual args fields
+    // are moved into CacheConfig etc. None when incomplete → feature stays off.
+    let natmap_config = natmap_config_from_args(&args);
 
     create_dirs(vec![&args.data_dir, &args.cache_dir, &args.log_dir, &args.temp_dir, &args.download_dir]).await?;
 
@@ -248,7 +280,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Proxy
     let proxy = match args.proxy.as_ref().map(Proxy::all) {
         Some(Ok(proxy)) => {
-            info!("Using proxy for fetch cache: {}", args.proxy.unwrap());
+            info!("Using proxy for fetch cache: {}", args.proxy.as_ref().unwrap());
             Some(proxy)
         }
         Some(Err(err)) => {
@@ -283,12 +315,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let server_handle = server.handle();
 
+    // Optional NAT port-sync (pre-startup): reconcile the registered port with
+    // the external port published by natmap BEFORE notifying the server of
+    // startup, so the connectivity test in connect_check runs against the
+    // correct port. Blocks startup until the registered port matches, retrying
+    // with backoff on any failure. The same instance is reused for the
+    // background poll loop below.
+    let natmap_sync = match &natmap_config {
+        Some(config) => {
+            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone());
+            if !sync.sync_until_ready().await {
+                error!("natmap: pre-startup sync cancelled by user");
+                return Err("natmap pre-startup sync interrupted by Ctrl+C".into());
+            }
+            Some(sync)
+        }
+        None => None,
+    };
+
     info!("Notifying the server that we have finished starting up the client...");
-    if client.connect_check(init_settings).await.is_none() {
-        error!("Startup notification failed.");
-        sleep(Duration::from_secs(5)).await;
-        return Err(error::Error::ConnectTestFail.into());
-    }
+    connect_until_ready(&client, &init_settings).await?;
 
     // Check download jobs
     client.refresh_settings().await;
@@ -301,6 +347,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     info!("H@H initialization completed successfully. Starting normal operation");
+
+    // Background poll loop. Reuses the NatmapSync instance built before
+    // connect_check; `natmap_config` is still in scope to log the config.
+    let natmap_handle = match (&natmap_config, natmap_sync) {
+        (Some(config), Some(sync)) => {
+            info!("Starting natmap port-sync (instance={}, interval={}s)", config.instance, config.poll_interval.as_secs());
+            Some(tokio::spawn(async move {
+                sync.run().await;
+            }))
+        }
+        (None, None) => {
+            info!(
+                "natmap port-sync disabled (set --natmap-api-endpoint, --natmap-instance, \
+                 --ipb-member-id and --ipb-pass-hash to enable)"
+            );
+            None
+        }
+        // natmap_sync is Some iff natmap_config is Some (both built together above).
+        _ => unreachable!("natmap_sync and natmap_config must agree"),
+    };
 
     // Command listener
     let client2 = client.clone();
@@ -403,6 +469,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     wait_shutdown_signal(shutdown_recv).await; // TODO force shutdown
     info!("Shutting down...");
     keepalive.abort();
+    if let Some(handle) = natmap_handle {
+        handle.abort();
+    }
     client.shutdown().await;
     if let Some(job) = downloader.lock().as_ref() {
         job.abort();
@@ -413,6 +482,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     cache_manager.save_state().await;
     logger.shutdown().await;
     Ok(())
+}
+
+/// Retry `client_start` until the server confirms connectivity, using
+/// exponential backoff. Only `FAIL_CONNECT_TEST` is retried — any other
+/// failure (duplicate client, wrong config, …) is fatal and returned
+/// immediately so the process can exit cleanly.
+///
+/// DNAT rules applied by natmap take effect almost instantly, so we start
+/// with a short 5 s delay and double up to 60 s.
+async fn connect_until_ready(client: &Arc<RPCClient>, init_settings: &rpc::InitSettings) -> Result<(), Box<dyn Error>> {
+    const INITIAL_DELAY: Duration = Duration::from_secs(5);
+    const MAX_DELAY: Duration = Duration::from_secs(60);
+    let mut delay = INITIAL_DELAY;
+    loop {
+        match client.connect_check(init_settings).await {
+            ConnectCheckResult::Ok => return Ok(()),
+            ConnectCheckResult::Fatal => {
+                error!("Startup notification failed.");
+                sleep(Duration::from_secs(5)).await;
+                return Err(error::Error::ConnectTestFail.into());
+            }
+            ConnectCheckResult::ConnectTestFail => {
+                warn!("connect_check: retrying in {:?}...", delay);
+                let interrupted = tokio::select! {
+                    _ = sleep(delay) => false,
+                    _ = signal::ctrl_c() => {
+                        info!("connect_check: interrupted by Ctrl+C");
+                        true
+                    }
+                };
+                if interrupted {
+                    return Err("connect_check interrupted by Ctrl+C".into());
+                }
+                delay = delay.saturating_mul(2).min(MAX_DELAY);
+            }
+        }
+    }
 }
 
 /**
@@ -481,6 +587,21 @@ After registering, enter your ID and Key below to start your client.
     }
 
     Ok((id, key))
+}
+
+/// Build the natmap port-sync config from CLI/env args, filtering out empty
+/// strings. Returns None when any required field is missing, which leaves the
+/// feature disabled.
+fn natmap_config_from_args(args: &Args) -> Option<NatmapConfig> {
+    // Treat missing or empty strings as "unset" so the feature stays off.
+    let non_empty = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    Some(NatmapConfig {
+        api_endpoint: non_empty(&args.natmap_api_endpoint)?,
+        instance: non_empty(&args.natmap_instance)?,
+        ipb_member_id: non_empty(&args.ipb_member_id)?,
+        ipb_pass_hash: non_empty(&args.ipb_pass_hash)?,
+        poll_interval: Duration::from_secs(args.natmap_poll_interval),
+    })
 }
 
 #[cfg(unix)]
