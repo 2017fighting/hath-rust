@@ -1,0 +1,222 @@
+name: Publish
+
+# Fork-owned image publishing. Upstream syncing is handled by a separate
+# project, so this workflow deliberately knows nothing about upstream: it
+# builds whatever commit triggered it and publishes the resulting images.
+#
+# Triggers:
+#   - push of a v* tag: publishes :<tag> + :latest (+ the -tiny variants)
+#   - workflow_dispatch: same, with an explicit image tag and optionally an
+#     explicit ref to build
+#
+# Why this is not upstream's docker-publish.yml:
+#   - that file also pushes to Docker Hub, and it is kept byte-identical to
+#     upstream (and disabled) so upstream syncs never conflict on it
+#   - its reusable-workflow indirection (build.yml) checks out the event-time
+#     SHA, which is not necessarily the commit a manual dispatch wants
+#
+# Nothing here merges upstream or cuts tags; the tag is the release signal.
+#
+# Retired (2026-09, removed with the upstream-sync pipeline): daily
+# date-stamped tags, and patch-bumping the fork's own vX.Y.Z line on a
+# schedule. Renovate/downstream pin vX.Y.Z, so tags are cut deliberately.
+
+"on":
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to publish, e.g. v1.17.0"
+        required: true
+        type: string
+      ref:
+        description: "Git ref to build (default: the ref this was dispatched from)"
+        required: false
+        type: string
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="$INPUT_TAG"
+          [ -n "$TAG" ] || TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publishing images tagged: $TAG"
+
+  build-linux:
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "armv7-unknown-linux-gnueabihf",
+          ]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Install amd64 build tools
+        if: ${{ matrix.target == 'x86_64-unknown-linux-gnu' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y crossbuild-essential-amd64
+      - name: Install arm build tools
+        if: ${{ matrix.target == 'armv7-unknown-linux-gnueabihf' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y crossbuild-essential-armhf
+      - name: Set Jemalloc page size to 64K for aarch64
+        if: ${{ matrix.target == 'aarch64-unknown-linux-gnu' }}
+        run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> "$GITHUB_ENV"
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install toolchain
+        run: |
+          rustup update
+          rustup target add ${{ matrix.target }}
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "x86_64-linux-gnu-gcc"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: "arm-linux-gnueabihf-gcc"
+        run: cargo build --verbose --release --target=${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hath-rust-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/hath-rust
+
+  Docker:
+    needs: [version, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Create Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          # syntax=docker/dockerfile:1
+          FROM scratch AS binary-amd64
+          COPY artifacts/hath-rust-x86_64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM scratch AS binary-arm64
+          COPY artifacts/hath-rust-aarch64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM scratch AS binary-arm
+          COPY artifacts/hath-rust-armv7-unknown-linux-gnueabihf/hath-rust /hath-rust
+          FROM binary-$TARGETARCH AS binary
+          FROM debian:trixie-slim
+          WORKDIR /hath
+          COPY --from=binary --chmod=755 /hath-rust /usr/local/bin/hath-rust
+          ENTRYPOINT ["hath-rust"]
+          EOF
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}
+
+  Docker-tiny:
+    needs: [version, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Create Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile
+          # syntax=docker/dockerfile:1
+          FROM debian:trixie AS binary-amd64
+          RUN cp /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-x86_64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM debian:trixie AS binary-arm64
+          RUN cp /usr/lib/aarch64-linux-gnu/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-aarch64-unknown-linux-gnu/hath-rust /hath-rust
+          FROM debian:trixie AS binary-arm
+          RUN cp /usr/lib/arm-linux-gnueabihf/libgcc_s.so.1 /
+          COPY artifacts/hath-rust-armv7-unknown-linux-gnueabihf/hath-rust /hath-rust
+          FROM binary-$TARGETARCH AS binary
+          FROM busybox:stable-glibc
+          WORKDIR /hath
+          COPY --from=binary /libgcc_s.so.1 /lib/libgcc_s.so.1
+          COPY --from=binary --chmod=755 /hath-rust /usr/local/bin/hath-rust
+          ENTRYPOINT ["hath-rust"]
+          EOF
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Setup Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest-tiny
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-tiny
