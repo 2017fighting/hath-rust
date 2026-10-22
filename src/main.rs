@@ -342,7 +342,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // background poll loop below.
     let natmap_sync = match &natmap_config {
         Some(config) => {
-            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone());
+            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone(), args.host);
             if !sync.sync_until_ready().await {
                 error!("natmap: pre-startup sync cancelled by user");
                 return Err("natmap pre-startup sync interrupted by Ctrl+C".into());

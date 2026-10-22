@@ -12,7 +12,7 @@
 //! reusing `RPCClient` for the RPC actions and adding only the router poll and
 //! the web-settings POST.
 
-use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
+use std::{collections::HashMap, error::Error, net::IpAddr, sync::Arc, time::Duration};
 
 use log::{error, info, warn};
 use reqwest::{
@@ -147,15 +147,21 @@ enum ReconcileResult {
 }
 
 impl NatmapSync {
-    pub fn new(config: NatmapConfig, client: Arc<RPCClient>, metrics: Arc<Metrics>, proxy: Option<Proxy>) -> Self {
+    pub fn new(
+        config: NatmapConfig,
+        client: Arc<RPCClient>,
+        metrics: Arc<Metrics>,
+        proxy: Option<Proxy>,
+        local_addr: Option<IpAddr>,
+    ) -> Self {
         // Two HTTP clients:
         //   http       – no proxy, for the LAN-only natmap API fetch.
         //   http_proxy – with proxy (optional), for the e-hentai.org settings POST.
         if proxy.is_some() {
             info!("natmap: using proxy for e-hentai settings POST");
         }
-        let http = create_http_client(Duration::from_secs(10), None);
-        let http_proxy = create_http_client(Duration::from_secs(10), proxy);
+        let http = create_http_client(Duration::from_secs(10), None, local_addr);
+        let http_proxy = create_http_client(Duration::from_secs(10), proxy, local_addr);
         Self {
             config,
             client,
