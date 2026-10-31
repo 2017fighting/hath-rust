@@ -322,6 +322,12 @@ The program will now terminate.
     pub async fn suspend(&self) {
         match self.send_action("client_suspend", None).await {
             Ok(res) if res.is_ok() => info!("Client suspended"),
+            // Expected pre-startup and after an unclean shutdown: there is no
+            // live session server-side, so there is nothing to suspend — and
+            // no "running" flag that would block a web-settings change.
+            Ok(res) if res.status.starts_with("FAIL_NOT_LOGGED_IN") => {
+                info!("client_suspend: no active server session; nothing to suspend")
+            }
             Ok(res) => warn!("client_suspend returned non-OK: {}", res.status),
             Err(err) => error!("client_suspend request failed: {}", err),
         }
