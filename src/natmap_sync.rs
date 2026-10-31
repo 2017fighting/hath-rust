@@ -99,9 +99,12 @@ impl HathWebSettings {
         }
     }
 
-    /// Build the form body for the settings POST. Mirrors
-    /// `dump_for_update_websettings` from the Python sidecar, including the
-    /// `f_enable_bwm=on` checkbox only when bandwidth management is enabled.
+    /// Build the form body for the settings POST. Field names and the shape
+    /// match the browser form exactly (verified against a captured POST:
+    /// `submit`, not `subbmit`, and `f_enable_bwm=on` only when bandwidth
+    /// management is enabled). The server silently ignores malformed forms —
+    /// it re-renders the page with HTTP 200 — so any deviation is invisible
+    /// without the response verification in `update_port`.
     pub fn to_form(&self) -> Vec<(String, String)> {
         let mut form = vec![
             ("settings".to_string(), "1".to_string()),
@@ -111,7 +114,7 @@ impl HathWebSettings {
             ("f_disklimit_GB".to_string(), format!("{}", self.disklimit_gb)),
             ("p_mthbwcap".to_string(), self.mthbw_cap.to_string()),
             ("f_diskremaining_MB".to_string(), format!("{}", self.diskremaining_mb)),
-            ("subbmit".to_string(), "Apply Settings".to_string()),
+            ("submit".to_string(), "Apply Settings".to_string()),
         ];
         if self.enable_bwm {
             form.push(("f_enable_bwm".to_string(), "on".to_string()));
@@ -203,10 +206,7 @@ impl NatmapSync {
                     return true;
                 }
                 ReconcileResult::Failed => {
-                    warn!(
-                        "natmap: pre-startup sync did not complete; retrying in {:?}",
-                        delay
-                    );
+                    warn!("natmap: pre-startup sync did not complete; retrying in {:?}", delay);
                     let interrupted = tokio::select! {
                         _ = sleep(delay) => false,
                         _ = tokio::signal::ctrl_c() => {
@@ -327,10 +327,12 @@ impl NatmapSync {
         }
     }
 
-    /// POST the new settings to the central settings page. Returns false on any
-    /// failure so the caller leaves the client suspended for a next-cycle retry.
-    /// Uses the proxy-enabled client since e-hentai.org requires a proxy/VPN
-    /// from some networks.
+    /// POST the new settings to the central settings page, then verify the
+    /// change actually applied. Returns false on any failure — including a
+    /// HTTP 200 whose re-rendered form still shows the old port — so the
+    /// caller leaves the client suspended for a next-cycle retry. Uses the
+    /// proxy-enabled client since e-hentai.org requires a proxy/VPN from some
+    /// networks.
     async fn update_port(&self, settings: &HathWebSettings) -> bool {
         let url = format!("{}?cid={}&act=settings", SETTINGS_URL, self.client.id());
         let cookie = format!("ipb_member_id={}; ipb_pass_hash={}", self.config.ipb_member_id, self.config.ipb_pass_hash);
@@ -347,13 +349,37 @@ impl NatmapSync {
             .await
         {
             Ok(resp) => {
-                if resp.status().is_success() {
-                    true
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    error!("natmap: settings POST returned status={} body={}", status, body);
-                    false
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    let snippet: String = body.chars().take(2000).collect();
+                    error!("natmap: settings POST returned status={status} body={snippet}");
+                    return false;
+                }
+                // The settings page answers 200 with the form re-rendered
+                // whether it applied the change or silently rejected it (e.g.
+                // "port cannot be changed while the client is running"), so
+                // HTTP 200 alone is not proof. The re-rendered form carries
+                // the server's current values — require f_port to show the
+                // port we just posted.
+                match parse_form_port(&body) {
+                    Some(port) if port == settings.port => true,
+                    Some(port) => {
+                        error!(
+                            "natmap: settings POST returned 200 but the form still shows \
+                             f_port={port} (expected {}); the server rejected the change — \
+                             is the client still marked as running?",
+                            settings.port
+                        );
+                        false
+                    }
+                    None => {
+                        error!(
+                            "natmap: settings POST response had no f_port input — not the \
+                             settings form (bad cookies or login redirect?)"
+                        );
+                        false
+                    }
                 }
             }
             Err(err) => {
@@ -371,6 +397,19 @@ impl NatmapSync {
     fn inc_sync(&self, labels: crate::metrics::NatmapSyncLabels) {
         self.metrics.natmap_sync_total.get_or_create(&labels).inc();
     }
+}
+
+/// Extract the value of the `f_port` input from a rendered settings form,
+/// e.g. `<input type="text" name="f_port" value="47362" />` → `47362`.
+/// Returns `None` when the input is missing or its value is not a port —
+/// `update_port` treats that as a failed POST (login redirect, garbage
+/// response, …).
+fn parse_form_port(body: &str) -> Option<u16> {
+    let name = body.find("name=\"f_port\"")?;
+    let rest = &body[name..];
+    let value = rest.find("value=\"")? + "value=\"".len();
+    let end = rest[value..].find('"')? + value;
+    rest[value..end].parse().ok()
 }
 
 #[cfg(test)]
@@ -435,7 +474,11 @@ mod tests {
         assert_eq!(form.get("f_diskremaining_MB"), Some(&"500".to_string()));
         assert_eq!(form.get("p_mthbwcap"), Some(&"0".to_string()));
         assert_eq!(form.get("f_enable_bwm"), Some(&"on".to_string()));
-        assert_eq!(form.get("subbmit"), Some(&"Apply Settings".to_string()));
+        // `submit` — matching the browser form. The historical `subbmit` typo
+        // was never verified against the server (every real POST died in
+        // transport before reaching it); a captured browser POST uses
+        // `submit=Apply Settings` and is known to apply.
+        assert_eq!(form.get("submit"), Some(&"Apply Settings".to_string()));
     }
 
     #[test]
@@ -460,5 +503,30 @@ mod tests {
         assert_eq!(m.port, 12345);
         assert_eq!(m.inner_port, 12345);
         assert_eq!(m.protocol, "tcp");
+    }
+
+    /// The exact markup shape e-hentai renders (captured 2026-10-31).
+    #[test]
+    fn parse_form_port_reads_real_form() {
+        let html = "<p>Current Value: <span style=\"font-weight:bold\">47362</span></p>\n\t\t<p>New Value: <input type=\"text\" name=\"f_port\" value=\"47362\" /></p>";
+        assert_eq!(parse_form_port(html), Some(47362));
+    }
+
+    /// An unchanged (rejected) POST re-renders with the old port — the parser
+    /// must read that value back so `update_port` can flag the rejection.
+    #[test]
+    fn parse_form_port_reads_rejected_value() {
+        let html = "<input type=\"text\" name=\"f_port\" value=\"39628\" />";
+        assert_eq!(parse_form_port(html), Some(39628));
+    }
+
+    #[test]
+    fn parse_form_port_missing_when_form_absent() {
+        assert_eq!(parse_form_port("<html>please log in</html>"), None);
+    }
+
+    #[test]
+    fn parse_form_port_rejects_non_numeric() {
+        assert_eq!(parse_form_port("<input name=\"f_port\" value=\"abc\" />"), None);
     }
 }
