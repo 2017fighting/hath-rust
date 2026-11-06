@@ -56,6 +56,7 @@ mod middleware;
 mod natmap_sync;
 mod route;
 mod rpc;
+mod rpc_servers_state;
 mod server;
 mod util;
 
@@ -188,6 +189,13 @@ struct Args {
     /// Also via HATH_NATMAP_POLL_INTERVAL.
     #[arg(long, env = "HATH_NATMAP_POLL_INTERVAL", default_value_t = 60)]
     natmap_poll_interval: u64,
+
+    /// Where to write the state file mirroring the RPC server address list the
+    /// server last pushed (one normalized address per line, LF terminated).
+    /// Read by consumers outside the process, e.g. egress derivation.
+    /// Also via HATH_RPC_SERVERS_STATE_FILE. Defaults to /hath/data/rpc_servers.
+    #[arg(long, env = "HATH_RPC_SERVERS_STATE_FILE")]
+    rpc_servers_state_file: Option<String>,
 }
 
 type DownloadState = Mutex<HashMap<[u8; 20], (watch::Receiver<Option<Arc<TempPath>>>, Arc<watch::Sender<u64>>)>>;
@@ -260,8 +268,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some(i) => i,
         None => setup(&args.data_dir).await?,
     };
-    let client =
-        Arc::new(RPCClient::new(id, &key, args.disable_ip_origin_check, args.max_connection, args.rpc_server_ip.as_deref(), args.host));
+    let client = Arc::new(RPCClient::new(
+        id,
+        &key,
+        args.disable_ip_origin_check,
+        args.max_connection,
+        args.rpc_server_ip.as_deref(),
+        args.host,
+        rpc_servers_state::resolve(args.rpc_servers_state_file.as_deref()),
+    ));
     let init_settings = match client.login().await {
         Ok(settings) => settings,
         Err(err) => {
