@@ -2,7 +2,7 @@ use std::{
     cmp::min,
     collections::HashMap,
     net::IpAddr,
-    str::FromStr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
@@ -20,6 +20,7 @@ use reqwest::{IntoUrl, Url};
 use crate::{
     error::Error,
     gallery_downloader::GalleryMeta,
+    rpc_servers_state,
     server::ParsedCert,
     util::{create_http_client, string_to_hash},
 };
@@ -36,6 +37,9 @@ pub struct RPCClient {
     key: String,
     reqwest: reqwest::Client,
     rpc_servers: RwLock<Vec<String>>,
+    /// Where the current `rpc_servers` list is mirrored on disk, so consumers
+    /// outside the process can read it (see `rpc_servers_state`).
+    rpc_servers_state: PathBuf,
     running: AtomicBool,
     settings: Arc<Settings>,
 }
@@ -125,6 +129,7 @@ impl RPCClient {
         max_connection: u64,
         bootstrap_server: Option<&str>,
         local_addr: Option<IpAddr>,
+        rpc_servers_state: PathBuf,
     ) -> Self {
         if disable_ip_check {
             warn!("Disable server command ip check!");
@@ -141,6 +146,7 @@ impl RPCClient {
             key: key.to_string(),
             reqwest: create_http_client(Duration::from_secs(600), None, local_addr),
             rpc_servers: RwLock::new(vec![]),
+            rpc_servers_state,
             running: AtomicBool::new(false),
             settings: Arc::new(Settings {
                 size_limit: AtomicU64::new(u64::MAX),
@@ -568,17 +574,15 @@ The program will now terminate.
     fn update_settings(&self, settings: HashMap<&str, &str>) {
         // Update RPC server IP
         if let Some(ips) = settings.get("rpc_server_ip") {
+            let servers = rpc_servers_state::parse(ips);
             {
-                *self.rpc_servers.write() = ips
-                    .split(';')
-                    .filter_map(|s| IpAddr::from_str(s).ok())
-                    .map(|ip| match ip {
-                        IpAddr::V4(ip) => ip.to_string(),
-                        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(|| ip.to_string(), |ip| ip.to_string()),
-                    })
-                    .collect();
+                *self.rpc_servers.write() = servers.clone();
             }
-            debug!("Setting altered: rpc_server_ip={}", self.rpc_servers.read().join(";"));
+            debug!("Setting altered: rpc_server_ip={}", servers.join(";"));
+            // Durable copy for consumers outside the process: the list lives in
+            // memory only, and the one log line carrying it rotates away in
+            // ~3h. Best effort — a write failure is logged and ignored.
+            rpc_servers_state::persist(&self.rpc_servers_state, &servers);
             self.change_server();
         }
         // Update settings
@@ -662,5 +666,29 @@ fn parse_response(res: &str) -> ApiResponse {
             status: "NO_RESPONSE".to_string(),
             data: vec![],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The state file only helps if `update_settings` is what writes it — the
+    /// pure parse/format/atomic-write behaviour is covered in
+    /// `rpc_servers_state::tests`, this one guards the wiring between them.
+    #[test]
+    fn update_settings_mirrors_the_address_list_to_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rpc_servers");
+        let client = RPCClient::new(1, "key", true, 0, None, None, path.clone());
+
+        let mut map = HashMap::new();
+        map.insert("rpc_server_ip", "::ffff:1.2.3.4;5.6.7.8;;");
+        client.update_settings(map);
+
+        // Exactly the addresses, normalized, nothing else from the settings map.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1.2.3.4\n5.6.7.8\n");
+        // The in-memory list used by `change_server` is unchanged by the write.
+        assert_eq!(*client.rpc_servers.read(), vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()]);
     }
 }
