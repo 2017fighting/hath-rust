@@ -11,10 +11,32 @@
 //! It is a faithful Rust port of the previous `natmap-sidecar` Python service,
 //! reusing `RPCClient` for the RPC actions and adding only the router poll and
 //! the web-settings POST.
+//!
+//! Two mapping sources exist, in this order:
+//!
+//! 1. the **punch file** (`HATH_PUNCH_FILE`): the `punch.json` the punch
+//!    controller mounts from the `<name>-punch` ConfigMap. This is the source
+//!    the declared punch writes (ADR-0044); the file is re-read every pass, so
+//!    a deleted ConfigMap (punch down) is visible to a running client.
+//! 2. the **natmap HTTP API** (`HATH_NATMAP_API_ENDPOINT`/`HATH_NATMAP_INSTANCE`):
+//!    kept for compatibility with the router package the controller replaces.
+//!
+//! The file wins when it yields a mapping; otherwise the HTTP source is polled.
+//! A missing or unparsable file is *no mapping from that source this pass*, not
+//! a fatal error: it is logged (rate-limited to a change of state, not every
+//! tick) and the retry loop of the caller handles it.
 
-use std::{collections::HashMap, error::Error, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use log::{error, info, warn};
+use parking_lot::Mutex;
 use reqwest::{
     Client, Proxy,
     header::{CONTENT_TYPE, COOKIE},
@@ -38,20 +60,99 @@ const STARTUP_SYNC_INITIAL: Duration = Duration::from_secs(5);
 /// Upper bound for the pre-startup retry backoff.
 const STARTUP_SYNC_MAX: Duration = Duration::from_secs(300);
 
-/// All configuration the port-sync task needs. When any field is unset at
-/// startup the task is not spawned, so this feature is purely opt-in.
+/// All configuration the port-sync task needs. It is built only when at least
+/// one mapping source is configured; when none is, the task is not spawned and
+/// this feature stays off.
 #[derive(Clone)]
 pub struct NatmapConfig {
+    /// Path of the punch file (`punch.json`) written by the punch controller and
+    /// mounted from the `<name>-punch` ConfigMap. Read first on every pass; when
+    /// it is absent or unparsable the HTTP source below is polled instead.
+    pub punch_file: Option<PathBuf>,
     /// Base URL of the router-side natmap API, e.g. `http://192.168.9.1/natmap`.
-    pub api_endpoint: String,
+    /// Only a source together with `instance`.
+    pub api_endpoint: Option<String>,
     /// natmap instance id; its mapping is fetched from `<api_endpoint>/<instance>.json`.
-    pub instance: String,
+    pub instance: Option<String>,
     /// Forum cookie `ipb_member_id`, used to authenticate the settings POST.
     pub ipb_member_id: String,
     /// Forum cookie `ipb_pass_hash`, used to authenticate the settings POST.
     pub ipb_pass_hash: String,
-    /// How often to poll natmap and reconcile.
+    /// How often to poll the mapping source and reconcile.
     pub poll_interval: Duration,
+}
+
+impl NatmapConfig {
+    /// The natmap HTTP source, when both halves of it are configured. A half
+    /// configured pair is not a source: it cannot be polled.
+    fn http_source(&self) -> Option<(&str, &str)> {
+        match (self.api_endpoint.as_deref(), self.instance.as_deref()) {
+            (Some(endpoint), Some(instance)) => Some((endpoint, instance)),
+            _ => None,
+        }
+    }
+
+    /// The URL the HTTP source polls, when it is configured.
+    fn http_url(&self) -> Option<String> {
+        let (endpoint, instance) = self.http_source()?;
+        Some(format!("{}/{instance}.json", endpoint.trim_end_matches('/')))
+    }
+
+    fn punch_file_display(&self) -> String {
+        match &self.punch_file {
+            Some(path) => path.display().to_string(),
+            None => "<unset>".to_string(),
+        }
+    }
+
+    /// Where the mapping is read from, in precedence order, for logs. Says the
+    /// same thing the source selection does, so a log line and the behaviour
+    /// cannot drift apart.
+    pub fn source_summary(&self) -> String {
+        match (self.punch_file.is_some(), self.http_url()) {
+            (true, Some(url)) => format!("punch file {} first, then the natmap API {url}", self.punch_file_display()),
+            (true, None) => format!("punch file {}", self.punch_file_display()),
+            (false, Some(url)) => format!("natmap API {url}"),
+            (false, None) => "no mapping source configured".to_string(),
+        }
+    }
+}
+
+/// Which source produced a pass's mapping. Logged on change, so a switch
+/// between the file and the HTTP API is visible without a line per tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappingSource {
+    PunchFile,
+    NatmapHttp,
+}
+
+/// Why the punch file produced no mapping this pass. Every variant means the
+/// same thing to the caller ("no mapping from the file"); they differ only in
+/// what the rate-limited warning says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PunchFileProblem {
+    Missing,
+    Unreadable,
+    Malformed,
+}
+
+impl PunchFileProblem {
+    fn describe(self) -> &'static str {
+        match self {
+            PunchFileProblem::Missing => "is absent",
+            PunchFileProblem::Unreadable => "could not be read",
+            PunchFileProblem::Malformed => "is not a punch document",
+        }
+    }
+}
+
+/// What the last pass logged, so a steady state is quiet: one line when the
+/// source changes, one line when the punch file starts or stops producing a
+/// mapping.
+#[derive(Default)]
+struct SourceLog {
+    source: Option<MappingSource>,
+    file_problem: Option<PunchFileProblem>,
 }
 
 /// A NAT mapping record as published by natmap.
@@ -133,6 +234,8 @@ pub struct NatmapSync {
     /// Proxy-enabled client (e-hentai.org settings POST).
     http_proxy: Client,
     metrics: Arc<Metrics>,
+    /// What was logged last pass — see `SourceLog`.
+    log_state: Mutex<SourceLog>,
 }
 
 /// Outcome of a single reconciliation pass. `reconcile_once` does not call
@@ -171,6 +274,7 @@ impl NatmapSync {
             http,
             http_proxy,
             metrics,
+            log_state: Mutex::new(SourceLog::default()),
         }
     }
 
@@ -227,11 +331,11 @@ impl NatmapSync {
     /// registered port; if they differ, suspends and updates the settings
     /// page. Does NOT call `client_start` — the caller decides.
     async fn reconcile_once(&self) -> ReconcileResult {
-        // 1. Read the live NAT mapping.
-        let mapping = match self.fetch_natmap().await {
+        // 1. Read the live NAT mapping (punch file first, natmap API second).
+        let mapping = match self.fetch_mapping().await {
             Some(mapping) => mapping,
             None => {
-                warn!("natmap: instance `{}` not registered or unreachable; skipping", self.config.instance);
+                warn!("natmap: no mapping this pass from {}; skipping", self.config.source_summary());
                 self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
                 return ReconcileResult::Failed;
             }
@@ -294,10 +398,100 @@ impl NatmapSync {
         }
     }
 
+    /// The mapping for one pass: the punch file wins, the natmap HTTP API is
+    /// the fallback. `None` when neither source produced a mapping — which the
+    /// caller treats as a failed pass (retried, never fatal).
+    async fn fetch_mapping(&self) -> Option<NatmapMapping> {
+        let file_mapping = match &self.config.punch_file {
+            Some(path) => match self.read_punch_file(path).await {
+                Ok(mapping) => {
+                    self.note_file_problem(None, "");
+                    Some(mapping)
+                }
+                Err((problem, detail)) => {
+                    self.note_file_problem(Some(problem), &detail);
+                    None
+                }
+            },
+            None => None,
+        };
+        // Only poll the HTTP source when the file did not answer — the file is
+        // the source of a declared punch, and a fallback that runs anyway would
+        // make a healthy file indistinguishable from a slow one in the logs.
+        let http_mapping = match (file_mapping.is_none(), self.config.http_source()) {
+            (true, Some(_)) => self.fetch_natmap().await,
+            _ => None,
+        };
+        match select_mapping(file_mapping, http_mapping) {
+            Some((mapping, source)) => {
+                self.note_source(source);
+                Some(mapping)
+            }
+            None => None,
+        }
+    }
+
+    /// Read the punch file and parse it. `Err` is "no mapping from this source
+    /// this pass": the kubelet swaps the ConfigMap file atomically, so a read
+    /// or parse failure means the file is absent or being replaced — never a
+    /// reason to panic, and never a partially-filled mapping (a defaulted port
+    /// is a wrong port).
+    async fn read_punch_file(&self, path: &Path) -> Result<NatmapMapping, (PunchFileProblem, String)> {
+        let body = match tokio::fs::read_to_string(path).await {
+            Ok(body) => body,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err((PunchFileProblem::Missing, String::new()));
+            }
+            Err(err) => return Err((PunchFileProblem::Unreadable, err.to_string())),
+        };
+        parse_punch_mapping(&body).map_err(|err| (PunchFileProblem::Malformed, err))
+    }
+
+    /// Log the source a pass used, once per change.
+    fn note_source(&self, source: MappingSource) {
+        let mut state = self.log_state.lock();
+        if state.source == Some(source) {
+            return;
+        }
+        state.source = Some(source);
+        match source {
+            MappingSource::PunchFile => {
+                info!("natmap: mapping source is the punch file {}", self.config.punch_file_display())
+            }
+            MappingSource::NatmapHttp => {
+                info!("natmap: mapping source is the natmap HTTP API {}", self.config.http_url().unwrap_or_default())
+            }
+        }
+    }
+
+    /// Log the punch file not yielding a mapping, once per change of state, and
+    /// clear it when the file answers again. `detail` is only used when a
+    /// warning is actually emitted.
+    fn note_file_problem(&self, problem: Option<PunchFileProblem>, detail: &str) {
+        let mut state = self.log_state.lock();
+        if state.file_problem == problem {
+            return;
+        }
+        state.file_problem = problem;
+        match problem {
+            Some(problem) => {
+                let path = self.config.punch_file_display();
+                if detail.is_empty() {
+                    warn!("natmap: punch file {path} {}; no mapping from it this pass", problem.describe());
+                } else {
+                    warn!("natmap: punch file {path} {} ({detail}); no mapping from it this pass", problem.describe());
+                }
+            }
+            None => info!("natmap: punch file {} yields a mapping again", self.config.punch_file_display()),
+        }
+    }
+
     /// GET `<api_endpoint>/<instance>.json`. Returns `None` on 404 (instance not
-    /// registered) or any transport/parse error.
+    /// registered), any transport/parse error, or when the HTTP source is not
+    /// configured (the file-only deployment).
     async fn fetch_natmap(&self) -> Option<NatmapMapping> {
-        let url = format!("{}/{instance}.json", self.config.api_endpoint.trim_end_matches('/'), instance = self.config.instance);
+        let (endpoint, instance) = self.config.http_source()?;
+        let url = format!("{}/{instance}.json", endpoint.trim_end_matches('/'));
         let resp = match self.http.get(&url).send().await {
             Ok(resp) => resp,
             Err(err) => {
@@ -410,6 +604,36 @@ fn parse_form_port(body: &str) -> Option<u16> {
     let value = rest.find("value=\"")? + "value=\"".len();
     let end = rest[value..].find('"')? + value;
     rest[value..end].parse().ok()
+}
+
+/// Pick the mapping for a pass: the punch file wins, the natmap HTTP API is
+/// the fallback, and no data at all is no mapping. Pure, so the precedence is
+/// testable without a filesystem or a network.
+fn select_mapping(file: Option<NatmapMapping>, http: Option<NatmapMapping>) -> Option<(NatmapMapping, MappingSource)> {
+    match (file, http) {
+        (Some(mapping), _) => Some((mapping, MappingSource::PunchFile)),
+        (None, Some(mapping)) => Some((mapping, MappingSource::NatmapHttp)),
+        (None, None) => None,
+    }
+}
+
+/// Parse the punch file's content — natmap's document (`punch.json`), which the
+/// punch controller writes as `{ip, port, inner_port, protocol}`.
+///
+/// Whitespace-tolerant (a ConfigMap payload usually ends with a newline), but
+/// strict about shape: every field must be present, so a partial document can
+/// never become a mapping with a defaulted port. A document without a usable
+/// public tuple (empty `ip`, `port` 0) is not a mapping either — registering it
+/// would point the tracker at nothing.
+fn parse_punch_mapping(body: &str) -> Result<NatmapMapping, String> {
+    let mapping: NatmapMapping = serde_json::from_str(body.trim()).map_err(|err| format!("invalid punch document: {err}"))?;
+    if mapping.ip.trim().is_empty() {
+        return Err("punch document has an empty `ip`".to_string());
+    }
+    if mapping.port == 0 {
+        return Err("punch document has `port` 0".to_string());
+    }
+    Ok(mapping)
 }
 
 #[cfg(test)]
@@ -528,5 +752,74 @@ mod tests {
     #[test]
     fn parse_form_port_rejects_non_numeric() {
         assert_eq!(parse_form_port("<input name=\"f_port\" value=\"abc\" />"), None);
+    }
+
+    /// The exact document the punch controller writes (compact JSON, single key
+    /// `punch.json`) — the file source must read the same shape the HTTP source
+    /// does.
+    #[test]
+    fn punch_file_document_parses_into_natmap_mapping() {
+        let body = r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"tcp"}"#;
+        let mapping = parse_punch_mapping(body).expect("controller document must parse");
+        assert_eq!(
+            mapping,
+            NatmapMapping {
+                ip: "120.244.157.23".to_string(),
+                port: 38698,
+                inner_port: 44388,
+                protocol: "tcp".to_string(),
+            }
+        );
+    }
+
+    /// A trailing newline (what a ConfigMap mounted file typically carries) and
+    /// surrounding whitespace are not part of the document.
+    #[test]
+    fn punch_file_parsing_trims_surrounding_whitespace() {
+        let body = " \n{\"ip\":\"203.0.113.7\",\"port\":27500,\"inner_port\":44388,\"protocol\":\"tcp\"}\n\n";
+        assert_eq!(parse_punch_mapping(body).map(|m| m.port), Ok(27500));
+    }
+
+    /// (a) A valid file is preferred over the HTTP source, whatever port the
+    /// HTTP source reports.
+    #[test]
+    fn punch_file_is_preferred_over_http() {
+        let file = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"tcp"}"#).ok();
+        let http = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":11111,"inner_port":27257,"protocol":"tcp"}"#).ok();
+        let (mapping, source) = select_mapping(file, http).expect("a mapping is available");
+        assert_eq!(mapping.port, 38698);
+        assert_eq!(source, MappingSource::PunchFile);
+    }
+
+    /// (b) An absent file is not an error: the HTTP source is used instead.
+    #[test]
+    fn absent_punch_file_falls_back_to_http() {
+        let http = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":11111,"inner_port":27257,"protocol":"tcp"}"#).ok();
+        let (mapping, source) = select_mapping(None, http).expect("the HTTP source answers");
+        assert_eq!(mapping.port, 11111);
+        assert_eq!(source, MappingSource::NatmapHttp);
+    }
+
+    /// (c) A malformed file is no data: with no HTTP source configured the pass
+    /// has no mapping at all (and is retried), and the port the broken document
+    /// mentions must never reach the tracker.
+    #[test]
+    fn malformed_punch_file_is_no_mapping() {
+        // Garbage, a truncated write, and a document missing the fields the
+        // contract requires (this one carries a plausible port — the exact way
+        // a wrong port would slip through if the parse were lenient).
+        for body in ["", "{not json", r#"{"ip":"120.244.157.23","port":38698}"#] {
+            let file = parse_punch_mapping(body).ok();
+            assert!(file.is_none(), "{body:?} must not parse into a mapping");
+            assert!(select_mapping(file, None).is_none(), "{body:?} must be no mapping this pass");
+        }
+    }
+
+    /// A document without a usable public tuple is not a mapping: the tracker
+    /// would be pointed at nothing.
+    #[test]
+    fn punch_file_rejects_empty_ip_and_zero_port() {
+        assert!(parse_punch_mapping(r#"{"ip":"","port":38698,"inner_port":44388,"protocol":"tcp"}"#).is_err());
+        assert!(parse_punch_mapping(r#"{"ip":"120.244.157.23","port":0,"inner_port":44388,"protocol":"tcp"}"#).is_err());
     }
 }
