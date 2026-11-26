@@ -28,9 +28,10 @@ a bound port.
 
 `HATH_IPB_MEMBER_ID` and `HATH_IPB_PASS_HASH` (`--ipb-member-id`, `--ipb-pass-hash`) authenticate the
 settings POST. The halt is exported as `hath_natmap_halted`, the file's presence as
-`hath_natmap_punch_file_present`, and every pass is counted in
-`hath_natmap_sync_total{outcome="applied|no_change|error|halted"}`. The vocabulary is in
-[GLOSSARY.md](GLOSSARY.md).
+`hath_natmap_punch_file_present`, and every pass is counted in the outcome counter — registered as
+`natmap_sync_total` and exported as `hath_natmap_sync_total_total`, because prometheus-client appends
+`_total` to a counter's name — with `outcome` one of `Applied`, `NoChange`, `Error`, `Halted`. The
+vocabulary is in [GLOSSARY.md](GLOSSARY.md).
 
 ## Features
 ### New
