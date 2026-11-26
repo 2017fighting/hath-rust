@@ -169,8 +169,8 @@ struct Args {
 
     /// Path of the punch file (punch.json) the punch controller mounts from the
     /// <name>-punch ConfigMap, e.g. /punch/punch.json. The only mapping source:
-    /// the file is re-read on every tick, and its absence means the punch is
-    /// down, which halts the client until a mapping is back.
+    /// the file is re-read on every tick, and a document without a mapping (a
+    /// `down` punch writes `port: 0`) halts the client until one is back.
     /// Also via HATH_PUNCH_FILE.
     #[arg(long, env = "HATH_PUNCH_FILE")]
     punch_file: Option<String>,
@@ -361,8 +361,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Optional NAT port-sync (pre-startup): reconcile the registered port with
     // the public port published by the punch BEFORE notifying the server of
     // startup, so the connectivity test in connect_check runs against the
-    // correct port. Bounded when the punch yields no mapping (the process exits
-    // and the required <name>-punch mount holds the restart until there is one).
+    // correct port. No mapping halts (never exits), exactly as at runtime.
     // The same instance is reused for the background poll loop below.
     let natmap_sync = match &natmap_config {
         Some(config) => {

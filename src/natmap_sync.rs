@@ -8,21 +8,27 @@
 //! public port with the port the tracker has on record, and when they differ
 //! runs the proven suspend → update-settings → re-register flow.
 //!
-//! THE FILE IS ALSO A DECLARATION, so its absence is not "no news". A `down`
-//! punch DELETES the ConfigMap, which a running pod sees as the file
-//! disappearing — and a client whose port nothing forwards to is worse than a
-//! client that is not running: the tracker keeps pointing downloaders at a hole
-//! that is not there. So:
+//! THE FILE IS ALSO A DECLARATION, and the declaration is the *content*, not the
+//! presence. A `down` punch writes a document that says so (`port: 0`), and a
+//! client whose port nothing forwards to is worse than a client that is not
+//! running: the tracker keeps pointing downloaders at a hole that is not there.
+//! So **no mapping means HALTED** — at runtime and at startup alike:
 //!
-//! * **no mapping at runtime** ⇒ the client is *halted* (`client_suspend`, the
-//!   same primitive the port-change flow already uses), the file is re-read on
-//!   every tick, and the client is re-registered as soon as a mapping is back.
-//!   `decide` is the whole of that state machine, and it is pure.
-//! * **no mapping at startup** ⇒ the process gives up after
-//!   `STARTUP_PUNCH_BUDGET` and exits instead of wedging behind a bound port with
-//!   nothing registered (the tcp probes of a bound listener all pass, so the
-//!   wedge is invisible). The `<name>-punch` mount is required, so a restart is
-//!   gated by the ConfigMap itself; the exit is what makes the state readable.
+//! * `client_suspend` (the same primitive the port-change flow already uses), the
+//!   file re-read on every tick, and re-registration as soon as a mapping is
+//!   back. `decide` is the whole of that state machine, and it is pure.
+//! * The process never exits over it. Exiting would be a CrashLoop whenever the
+//!   pod restarts while the punch is down — which is the ordinary shape, not the
+//!   rare one — and the tracker treats a startup loop as an offence
+//!   (`FAIL_STARTUP_LOOP`: a 15-minute wait). A halted client waits for free.
+//!
+//! WHY PRESENCE IS NOT THE SIGNAL: kubelet never removes a mounted ConfigMap's
+//! files. When the ConfigMap is deleted under a running pod, the volume keeps its
+//! last payload and kubelet only logs `MountVolume.SetUp failed … not found`
+//! (measured 2026-11-26 on this cluster: the file was byte-identical 2.5 minutes
+//! after the ConfigMap was gone). "The file disappeared" therefore never reaches
+//! an app; "the document says down" does, because an *update* is projected
+//! (~60–90s). The punch contract was changed to say so (home-ops ADR-0044/0045).
 //!
 //! While halted, `still_alive` is not sent: the keepalive task checks the shared
 //! `halted` flag. The session is suspended, so the check is either meaningless
@@ -69,10 +75,6 @@ const SETTINGS_URL: &str = "https://e-hentai.org/hentaiathome.php";
 const RETRY_INITIAL: Duration = Duration::from_secs(15);
 /// Upper bound for both backoffs.
 const RETRY_MAX: Duration = Duration::from_secs(300);
-/// How long the pre-startup sync waits for the punch file to yield a mapping
-/// before the process gives up and exits.
-const STARTUP_PUNCH_BUDGET: Duration = Duration::from_secs(180);
-
 /// All configuration the port-sync task needs. It is built only when a punch
 /// file is configured; when none is, the task is not spawned and this feature
 /// stays off.
@@ -102,13 +104,17 @@ impl NatmapConfig {
 }
 
 /// Why the punch file produced no mapping this pass. Every variant means the
-/// same thing to the caller ("no mapping"); they differ only in what the
-/// rate-limited warning says and in whether the file is there at all.
+/// same thing to the caller ("no mapping"); they differ in whether the file is
+/// there at all, in what the rate-limited line says, and in whether it is a
+/// state to worry about (`Down` is not: it is how a punch says it is down).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PunchFileProblem {
     Missing,
     Unreadable,
     Malformed,
+    /// The document is well-formed and says the punch has no mapping
+    /// (`{"ip":"","port":0,…}`) — the normal shape of a `down` punch.
+    Down,
 }
 
 impl PunchFileProblem {
@@ -117,8 +123,19 @@ impl PunchFileProblem {
             PunchFileProblem::Missing => "is absent",
             PunchFileProblem::Unreadable => "could not be read",
             PunchFileProblem::Malformed => "is not a punch document for this client",
+            PunchFileProblem::Down => "says the punch is down",
         }
     }
+}
+
+/// Why a document is not a mapping. `Down` is the punch saying "nothing is
+/// mapped" — a state, not a defect — and it is kept apart from `Invalid` so the
+/// log line and the metrics can tell "the punch is down" from "this file is
+/// broken".
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PunchDocError {
+    Down,
+    Invalid(String),
 }
 
 /// What one pass should do, decided from the mapping and the client's state.
@@ -349,16 +366,18 @@ impl NatmapSync {
     /// exponential backoff. Called before `connect_check` so the client comes
     /// online with the correct registered port.
     ///
-    /// "No mapping from the punch file" is the one failure that is bounded
-    /// (`STARTUP_PUNCH_BUDGET`): a client that holds a bound port, never
-    /// registers, and retries forever is invisible from Kubernetes, while
-    /// exiting lets the cluster's own gate — the required `<name>-punch` mount —
-    /// hold the pod until the punch exists. Every other failure (login, settings
-    /// fetch, settings POST) is a network failure a restart cannot fix, so it
-    /// keeps retrying. Responds to Ctrl+C during sleep.
+    /// "No mapping" is handled exactly as it is at runtime: the client halts
+    /// (suspends) and keeps polling. It does NOT exit. Exiting here was the
+    /// first design, on the theory that the required `<name>-punch` mount would
+    /// gate the restart — but that gate is only sound while "no mapping" means
+    /// "no ConfigMap", and it does not: a `down` punch now writes a document
+    /// that says so, and the common shape becomes "punch down, pod restarted".
+    /// A process that exits there is a CrashLoop, and the tracker treats a
+    /// startup loop as an offence (`FAIL_STARTUP_LOOP` → a 15-minute wait), so a
+    /// client with nowhere to register waits rather than churns. Responds to
+    /// Ctrl+C during sleep.
     pub async fn sync_until_ready(&self) -> Result<(), Box<dyn Error>> {
         info!("natmap: running pre-startup port-sync...");
-        let started = Instant::now();
         let mut delay = RETRY_INITIAL;
         loop {
             let wait = match self.prestartup_once().await {
@@ -367,23 +386,16 @@ impl NatmapSync {
                     return Ok(());
                 }
                 PrestartupOutcome::NoMapping => {
-                    let left = STARTUP_PUNCH_BUDGET.saturating_sub(started.elapsed());
-                    if left.is_zero() {
-                        error!(
-                            "natmap: no mapping from {} after {:?}; refusing to start",
-                            self.config.source_summary(),
-                            STARTUP_PUNCH_BUDGET
-                        );
-                        return Err(format!(
-                            "no mapping from {} after {:?}: a punch that yields no mapping cannot be registered",
-                            self.config.source_summary(),
-                            STARTUP_PUNCH_BUDGET
-                        )
-                        .into());
+                    // The same halt the background loop applies, at the one moment
+                    // there is no session to suspend yet (the RPC tolerates that).
+                    if !self.is_halted() {
+                        info!("natmap: no mapping from the punch file; halting until it returns");
+                        self.client.suspend().await;
+                        self.set_halted(true);
                     }
-                    let wait = delay.min(left);
-                    warn!("natmap: no mapping from {}; retrying in {:?} (giving up in {:?})", self.config.source_summary(), wait, left);
-                    wait
+                    self.inc_sync(LABEL_NATMAP_SYNC_HALTED);
+                    warn!("natmap: no mapping from {}; retrying in {delay:?}", self.config.source_summary());
+                    delay
                 }
                 PrestartupOutcome::Failed => {
                     warn!("natmap: pre-startup sync did not complete; retrying in {delay:?}");
@@ -405,13 +417,18 @@ impl NatmapSync {
     }
 
     /// One pre-startup pass: make the tracker's registered port match the
-    /// punch. Does not re-notify the server (connect_check runs next) and does
-    /// not halt: nothing has registered yet.
+    /// punch, and drop the halt if the punch has a mapping again. Does not
+    /// re-notify the server — `connect_check` runs next and is what registers
+    /// this client for the first time.
     async fn prestartup_once(&self) -> PrestartupOutcome {
         let Some(mapping) = self.read_mapping().await else {
             return PrestartupOutcome::NoMapping;
         };
         self.metrics.natmap_port.set(mapping.port as u64);
+        // The halt is over: the mapping is back, so the keepalive may speak for
+        // this client again once connect_check has registered it.
+        self.set_halted(false);
+        self.resume_gate.lock().reset();
 
         let Some(map) = self.fetch_settings().await else {
             return PrestartupOutcome::Failed;
@@ -428,9 +445,10 @@ impl NatmapSync {
         info!("natmap: public port {} differs from registered port {}; updating", mapping.port, display_port(registered_port));
         // The settings page rejects changes while the client is active. Before
         // startup this also clears a stale server-side session left by an
-        // unclean shutdown, so it runs unconditionally rather than only for a
-        // known-registered port.
-        self.client.suspend().await;
+        // unclean shutdown, so it runs unless the halt already suspended us.
+        if !self.is_halted() {
+            self.client.suspend().await;
+        }
         if !self.update_port(&HathWebSettings::from_settings_map(&map, mapping.port)).await {
             error!("natmap: settings page update failed; will retry");
             self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
@@ -598,7 +616,10 @@ impl NatmapSync {
             }
             Err(err) => return Err((PunchFileProblem::Unreadable, err.to_string())),
         };
-        parse_punch_mapping(&body, self.listen_port).map_err(|err| (PunchFileProblem::Malformed, err))
+        parse_punch_mapping(&body, self.listen_port).map_err(|err| match err {
+            PunchDocError::Down => (PunchFileProblem::Down, String::new()),
+            PunchDocError::Invalid(detail) => (PunchFileProblem::Malformed, detail),
+        })
     }
 
     /// The tracker's `client_settings` map, or `None` when it could not be read.
@@ -620,6 +641,10 @@ impl NatmapSync {
         }
         state.problem = problem;
         match problem {
+            // A down punch is the state this task exists to react to, not a fault.
+            Some(PunchFileProblem::Down) => {
+                info!("natmap: punch file {} says the punch is down; no mapping from it", self.config.punch_file_display())
+            }
             Some(problem) => {
                 let path = self.config.punch_file_display();
                 if detail.is_empty() {
@@ -737,19 +762,28 @@ fn parse_form_port(body: &str) -> Option<u16> {
 /// * `inner_port` must be the port this client serves content on. A document
 ///   naming another port describes a redirect to somewhere else, so the port it
 ///   announces would never reach us.
-fn parse_punch_mapping(body: &str, listen_port: u16) -> Result<NatmapMapping, String> {
-    let mapping: NatmapMapping = serde_json::from_str(body.trim()).map_err(|err| format!("invalid punch document: {err}"))?;
-    if mapping.ip.trim().is_empty() {
-        return Err("punch document has an empty `ip`".to_string());
+fn parse_punch_mapping(body: &str, listen_port: u16) -> Result<NatmapMapping, PunchDocError> {
+    let invalid = |msg: String| PunchDocError::Invalid(msg);
+    let mapping: NatmapMapping = serde_json::from_str(body.trim()).map_err(|err| invalid(format!("invalid punch document: {err}")))?;
+    // The punch saying "down" — both fields at once, because that is what the
+    // controller writes for a `down` or `pending` punch. Half of it (an empty ip
+    // beside a live port, or the reverse) is a broken document, not a state.
+    let empty_ip = mapping.ip.trim().is_empty();
+    let zero_port = mapping.port == 0;
+    if empty_ip && zero_port {
+        return Err(PunchDocError::Down);
     }
-    if mapping.port == 0 {
-        return Err("punch document has `port` 0".to_string());
+    if empty_ip {
+        return Err(invalid("punch document has an empty `ip`".to_string()));
+    }
+    if zero_port {
+        return Err(invalid("punch document has `port` 0".to_string()));
     }
     if !mapping.protocol.eq_ignore_ascii_case("tcp") {
-        return Err(format!("punch document has protocol {:?}, not tcp", mapping.protocol));
+        return Err(invalid(format!("punch document has protocol {:?}, not tcp", mapping.protocol)));
     }
     if mapping.inner_port != listen_port {
-        return Err(format!("punch document has inner_port {}, but this client serves on {listen_port}", mapping.inner_port));
+        return Err(invalid(format!("punch document has inner_port {}, but this client serves on {listen_port}", mapping.inner_port)));
     }
     Ok(mapping)
 }
@@ -908,14 +942,23 @@ mod tests {
         }
     }
 
-    /// A document without a usable public tuple is not a mapping: the tracker
-    /// would be pointed at nothing.
+    /// The `down` shape the punch controller writes for a `down` or `pending` punch: both
+    /// fields empty at once. It is a STATE, not a defect, and the log line says so — a
+    /// half-empty document beside a live field is the opposite, a broken file.
     #[test]
-    fn punch_document_rejects_empty_ip_and_zero_port() {
-        let empty_ip = r#"{"ip":"","port":38698,"inner_port":44388,"protocol":"tcp"}"#;
-        let zero_port = r#"{"ip":"120.244.157.23","port":0,"inner_port":44388,"protocol":"tcp"}"#;
-        assert!(parse_punch_mapping(empty_ip, 44388).is_err());
-        assert!(parse_punch_mapping(zero_port, 44388).is_err());
+    fn down_document_is_a_state_and_a_half_one_is_a_defect() {
+        let down = r#"{"ip":"","port":0,"inner_port":44388,"protocol":"tcp"}"#;
+        assert_eq!(parse_punch_mapping(down, 44388), Err(PunchDocError::Down));
+
+        for body in [
+            r#"{"ip":"","port":38698,"inner_port":44388,"protocol":"tcp"}"#,
+            r#"{"ip":"120.244.157.23","port":0,"inner_port":44388,"protocol":"tcp"}"#,
+        ] {
+            assert!(
+                matches!(parse_punch_mapping(body, 44388), Err(PunchDocError::Invalid(_))),
+                "{body} must be a defect, not a down punch"
+            );
+        }
     }
 
     /// Strictness that matters: a punch forwarding to another port announces a

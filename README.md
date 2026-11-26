@@ -17,14 +17,15 @@ controller mounts from its ConfigMap, e.g. `/punch/punch.json`. Content is
 The document is read on every tick (`HATH_NATMAP_POLL_INTERVAL`, default 15s) and must describe a
 working punch: a missing file, unparsable JSON, an empty `ip`, `port: 0`, a protocol other than TCP,
 or an `inner_port` that is not this client's port are all **no mapping** this pass — never a mapping
-with a defaulted field.
+with a defaulted field. A `down` punch says so in the document (`port: 0`); the presence of the file
+proves nothing, because kubelet never removes a mounted ConfigMap's files.
 
 No mapping means the punch is down, so the client is **halted**: `client_suspend` is sent once, the
 file keeps being read, and the client is re-registered as soon as a mapping is back (the settings
 page is updated first if the port changed). While halted, no `still_alive` is sent — the session is
-suspended, and its answer would shut the process down. Before startup, no mapping is bounded: after
-three minutes the process exits, so a client that cannot register is visible instead of idling behind
-a bound port.
+suspended, and its answer would shut the process down. The same rule holds at startup: a client with
+nowhere to register waits rather than exits, because exiting would be a CrashLoop that the tracker
+penalises (`FAIL_STARTUP_LOOP`).
 
 `HATH_IPB_MEMBER_ID` and `HATH_IPB_PASS_HASH` (`--ipb-member-id`, `--ipb-pass-hash`) authenticate the
 settings POST. The halt is exported as `hath_natmap_halted`, the file's presence as

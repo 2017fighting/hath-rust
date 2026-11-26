@@ -11,9 +11,10 @@ client only ever learns it. _Avoid_: port forward, NAT rule (that is the redirec
 not the mapping), hole punching (the hole is the effect, not the object).
 
 **Punch File**: The document that publishes a Punch's current public tuple to this client — the
-`punch.json` key of the mounted `<name>-punch` ConfigMap. Its presence is the Punch's declaration;
-its absence means the Punch is down. _Avoid_: natmap.json, punch endpoint, "the ConfigMap" (the
-controller writes the ConfigMap; this is the key the client reads).
+`punch.json` key of the mounted `<name>-punch` ConfigMap. Its *content* is the Punch's declaration: a
+document with no public tuple means the Punch is down, and the file being there says nothing on its
+own. _Avoid_: natmap.json, punch endpoint, "the ConfigMap" (the controller writes the ConfigMap; this
+is the key the client reads), reading the file's presence as the signal.
 
 **Mapping**: A Punch File that describes a working punch — a public tuple plus this client's Listen
 Port. Anything else (absent, unparsable, wrong protocol, someone else's port) is no mapping.
