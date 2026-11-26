@@ -6,6 +6,27 @@ The unofficial Hentai@Home client written in Rust.
 ## Install
 Read the [Wiki](https://github.com/james58899/hath-rust/wiki/Install)
 
+## NAT port sync
+hath must tell the H@H tracker which public port it is reachable on, so it runs a port-sync loop
+that re-reads that port and updates the settings page when it changes. The port is read from one of
+two sources:
+
+1. **a file** — `HATH_PUNCH_FILE` (`--punch-file`), the path of the `punch.json` document a punch
+   controller mounts from its ConfigMap, e.g. `/punch/punch.json`. Content is
+   `{"ip": "<public ip>", "port": <public port>, "inner_port": <bind port>, "protocol": "tcp"}`.
+2. **the natmap HTTP API** — `HATH_NATMAP_API_ENDPOINT` (`--natmap-api-endpoint`, e.g.
+   `http://192.168.9.1/natmap`) plus `HATH_NATMAP_INSTANCE` (`--natmap-instance`), polled at
+   `<endpoint>/<instance>.json`.
+
+The file wins: it is re-read on every tick and is the source a punch controller writes. A missing or
+unparsable file is *no mapping from that source this pass* — logged once per change of state, never
+fatal — and the HTTP source is polled as the fallback when one is configured. With neither source
+configured, port-sync stays off.
+
+Whichever source answers, the rest of the loop is unchanged: `HATH_IPB_MEMBER_ID` and
+`HATH_IPB_PASS_HASH` (`--ipb-member-id`, `--ipb-pass-hash`) authenticate the settings POST, and
+`HATH_NATMAP_POLL_INTERVAL` (`--natmap-poll-interval`, default 60) sets the tick.
+
 ## Features
 ### New
 Features not included in the official.

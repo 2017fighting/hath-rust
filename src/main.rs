@@ -6,7 +6,7 @@ use std::{
     error::Error,
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -165,8 +165,8 @@ struct Args {
     enable_h3: bool,
 
     /// Base URL of the router-side natmap API, e.g. http://192.168.9.1/natmap.
-    /// Also via HATH_NATMAP_API_ENDPOINT. When any natmap-sync field is unset,
-    /// port-sync stays disabled.
+    /// Also via HATH_NATMAP_API_ENDPOINT. Only a mapping source together with
+    /// --natmap-instance, and only the fallback when --punch-file is set.
     #[arg(long, env = "HATH_NATMAP_API_ENDPOINT")]
     natmap_api_endpoint: Option<String>,
 
@@ -174,6 +174,13 @@ struct Args {
     /// Also via HATH_NATMAP_INSTANCE.
     #[arg(long, env = "HATH_NATMAP_INSTANCE")]
     natmap_instance: Option<String>,
+
+    /// Path of the punch file (punch.json) the punch controller mounts from the
+    /// <name>-punch ConfigMap, e.g. /punch/punch.json. Read first: when it is
+    /// absent or unparsable the natmap API above is used instead.
+    /// Also via HATH_PUNCH_FILE.
+    #[arg(long, env = "HATH_PUNCH_FILE")]
+    punch_file: Option<String>,
 
     /// Forum cookie ipb_member_id used to authenticate the settings POST.
     /// Also via HATH_IPB_MEMBER_ID.
@@ -386,15 +393,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // connect_check; `natmap_config` is still in scope to log the config.
     let natmap_handle = match (&natmap_config, natmap_sync) {
         (Some(config), Some(sync)) => {
-            info!("Starting natmap port-sync (instance={}, interval={}s)", config.instance, config.poll_interval.as_secs());
+            info!("Starting natmap port-sync ({}, interval={}s)", config.source_summary(), config.poll_interval.as_secs());
             Some(tokio::spawn(async move {
                 sync.run().await;
             }))
         }
         (None, None) => {
             info!(
-                "natmap port-sync disabled (set --natmap-api-endpoint, --natmap-instance, \
-                 --ipb-member-id and --ipb-pass-hash to enable)"
+                "natmap port-sync disabled (set --punch-file, or --natmap-api-endpoint and \
+                 --natmap-instance, plus --ipb-member-id and --ipb-pass-hash to enable)"
             );
             None
         }
@@ -624,14 +631,30 @@ After registering, enter your ID and Key below to start your client.
 }
 
 /// Build the natmap port-sync config from CLI/env args, filtering out empty
-/// strings. Returns None when any required field is missing, which leaves the
-/// feature disabled.
+/// strings. Returns None when there is no mapping source (neither a punch file
+/// nor both halves of the natmap API) or the forum cookies are missing, which
+/// leaves the feature disabled.
 fn natmap_config_from_args(args: &Args) -> Option<NatmapConfig> {
     // Treat missing or empty strings as "unset" so the feature stays off.
     let non_empty = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    let punch_file = non_empty(&args.punch_file).map(PathBuf::from);
+    // The HTTP source needs both halves; a half-configured pair cannot be
+    // polled, so it is not a source. The punch file may stand alone.
+    let http = match (non_empty(&args.natmap_api_endpoint), non_empty(&args.natmap_instance)) {
+        (Some(endpoint), Some(instance)) => Some((endpoint, instance)),
+        _ => None,
+    };
+    let (api_endpoint, instance) = match http {
+        Some((endpoint, instance)) => (Some(endpoint), Some(instance)),
+        None => (None, None),
+    };
+    if punch_file.is_none() && api_endpoint.is_none() {
+        return None;
+    }
     Some(NatmapConfig {
-        api_endpoint: non_empty(&args.natmap_api_endpoint)?,
-        instance: non_empty(&args.natmap_instance)?,
+        punch_file,
+        api_endpoint,
+        instance,
         ipb_member_id: non_empty(&args.ipb_member_id)?,
         ipb_pass_hash: non_empty(&args.ipb_pass_hash)?,
         poll_interval: Duration::from_secs(args.natmap_poll_interval),
