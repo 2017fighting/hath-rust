@@ -7,7 +7,10 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     ops::RangeInclusive,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -164,20 +167,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     enable_h3: bool,
 
-    /// Base URL of the router-side natmap API, e.g. http://192.168.9.1/natmap.
-    /// Also via HATH_NATMAP_API_ENDPOINT. Only a mapping source together with
-    /// --natmap-instance, and only the fallback when --punch-file is set.
-    #[arg(long, env = "HATH_NATMAP_API_ENDPOINT")]
-    natmap_api_endpoint: Option<String>,
-
-    /// natmap instance id; its mapping is fetched from <api_endpoint>/<instance>.json.
-    /// Also via HATH_NATMAP_INSTANCE.
-    #[arg(long, env = "HATH_NATMAP_INSTANCE")]
-    natmap_instance: Option<String>,
-
     /// Path of the punch file (punch.json) the punch controller mounts from the
-    /// <name>-punch ConfigMap, e.g. /punch/punch.json. Read first: when it is
-    /// absent or unparsable the natmap API above is used instead.
+    /// <name>-punch ConfigMap, e.g. /punch/punch.json. The only mapping source:
+    /// the file is re-read on every tick, and its absence means the punch is
+    /// down, which halts the client until a mapping is back.
     /// Also via HATH_PUNCH_FILE.
     #[arg(long, env = "HATH_PUNCH_FILE")]
     punch_file: Option<String>,
@@ -192,9 +185,11 @@ struct Args {
     #[arg(long, env = "HATH_IPB_PASS_HASH")]
     ipb_pass_hash: Option<String>,
 
-    /// natmap poll interval in seconds.
+    /// How often to re-read the punch file and reconcile the registered port.
+    /// Defaults to the punch controller's own reporting cadence, so a healed
+    /// punch is noticed on the next tick rather than up to a minute later.
     /// Also via HATH_NATMAP_POLL_INTERVAL.
-    #[arg(long, env = "HATH_NATMAP_POLL_INTERVAL", default_value_t = 60)]
+    #[arg(long, env = "HATH_NATMAP_POLL_INTERVAL", default_value_t = 15)]
     natmap_poll_interval: u64,
 
     /// Where to write the state file mirroring the RPC server address list the
@@ -356,19 +351,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let server_handle = server.handle();
 
+    // Shared with the natmap task: while the client is halted (the punch yields
+    // no mapping) the keepalive must not send `still_alive`. The session is
+    // suspended, so the check is either meaningless or answers
+    // FAIL_NOT_LOGGED_IN, which shuts the process down — a halt must not become
+    // a restart.
+    let halted: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     // Optional NAT port-sync (pre-startup): reconcile the registered port with
-    // the external port published by natmap BEFORE notifying the server of
+    // the public port published by the punch BEFORE notifying the server of
     // startup, so the connectivity test in connect_check runs against the
-    // correct port. Blocks startup until the registered port matches, retrying
-    // with backoff on any failure. The same instance is reused for the
-    // background poll loop below.
+    // correct port. Bounded when the punch yields no mapping (the process exits
+    // and the required <name>-punch mount holds the restart until there is one).
+    // The same instance is reused for the background poll loop below.
     let natmap_sync = match &natmap_config {
         Some(config) => {
-            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone(), args.host);
-            if !sync.sync_until_ready().await {
-                error!("natmap: pre-startup sync cancelled by user");
-                return Err("natmap pre-startup sync interrupted by Ctrl+C".into());
-            }
+            let sync = NatmapSync::new(config.clone(), client.clone(), metrics.clone(), proxy.clone(), args.host, port, halted.clone());
+            sync.sync_until_ready().await?;
             Some(sync)
         }
         None => None,
@@ -399,10 +398,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }))
         }
         (None, None) => {
-            info!(
-                "natmap port-sync disabled (set --punch-file, or --natmap-api-endpoint and \
-                 --natmap-instance, plus --ipb-member-id and --ipb-pass-hash to enable)"
-            );
+            info!("natmap port-sync disabled (set --punch-file plus --ipb-member-id and --ipb-pass-hash to enable)");
             None
         }
         // natmap_sync is Some iff natmap_config is Some (both built together above).
@@ -476,6 +472,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Schedule task
     let client3 = client.clone();
     let cache_manager3 = cache_manager.clone();
+    let halted3 = halted.clone();
     let keepalive = tokio::spawn(async move {
         let mut counter: u32 = 0;
         let mut interval = interval(Duration::from_secs(10));
@@ -487,8 +484,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 break;
             }
 
-            // Alive check every 110s
-            if counter.is_multiple_of(11) && !client3.still_alive(false).await {
+            // Alive check every 110s. Skipped while the client is halted: the
+            // session is suspended server-side, so the answer is either
+            // meaningless or FAIL_NOT_LOGGED_IN (which shuts us down).
+            if counter.is_multiple_of(11) && !halted3.load(Ordering::Relaxed) && !client3.still_alive(false).await {
                 let _ = shutdown_send.send(()); // Check fail, shutdown.
             }
 
@@ -631,30 +630,13 @@ After registering, enter your ID and Key below to start your client.
 }
 
 /// Build the natmap port-sync config from CLI/env args, filtering out empty
-/// strings. Returns None when there is no mapping source (neither a punch file
-/// nor both halves of the natmap API) or the forum cookies are missing, which
-/// leaves the feature disabled.
+/// strings. Returns None when no punch file is configured or the forum cookies
+/// are missing, which leaves the feature disabled.
 fn natmap_config_from_args(args: &Args) -> Option<NatmapConfig> {
     // Treat missing or empty strings as "unset" so the feature stays off.
     let non_empty = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(|s| s.to_string());
-    let punch_file = non_empty(&args.punch_file).map(PathBuf::from);
-    // The HTTP source needs both halves; a half-configured pair cannot be
-    // polled, so it is not a source. The punch file may stand alone.
-    let http = match (non_empty(&args.natmap_api_endpoint), non_empty(&args.natmap_instance)) {
-        (Some(endpoint), Some(instance)) => Some((endpoint, instance)),
-        _ => None,
-    };
-    let (api_endpoint, instance) = match http {
-        Some((endpoint, instance)) => (Some(endpoint), Some(instance)),
-        None => (None, None),
-    };
-    if punch_file.is_none() && api_endpoint.is_none() {
-        return None;
-    }
     Some(NatmapConfig {
-        punch_file,
-        api_endpoint,
-        instance,
+        punch_file: PathBuf::from(non_empty(&args.punch_file)?),
         ipb_member_id: non_empty(&args.ipb_member_id)?,
         ipb_pass_hash: non_empty(&args.ipb_pass_hash)?,
         poll_interval: Duration::from_secs(args.natmap_poll_interval),

@@ -1,51 +1,60 @@
 //! NAT port-sync background task.
 //!
-//! `natmap` (running on the router) publishes a NAT mapping whose external port
-//! can change over time. The central H@H tracker records a single port per
-//! client and rejects settings changes while the client is active. This task
-//! periodically polls the natmap API, compares its external port against the
-//! port the tracker currently has on record, and when they differ runs the
-//! proven suspend → update-web-settings → re-notify-start flow so the tracker's
-//! recorded port tracks the live external port.
+//! The router holds a mapping open for this client and the punch controller
+//! publishes it as a file — `HATH_PUNCH_FILE`, the `punch.json` key of the
+//! `<name>-punch` ConfigMap (ADR-0044). That file is the only mapping source.
+//! The central H@H tracker records one port per client and rejects settings
+//! changes while the client is active, so this task polls the file, compares its
+//! public port with the port the tracker has on record, and when they differ
+//! runs the proven suspend → update-settings → re-register flow.
 //!
-//! It is a faithful Rust port of the previous `natmap-sidecar` Python service,
-//! reusing `RPCClient` for the RPC actions and adding only the router poll and
-//! the web-settings POST.
+//! THE FILE IS ALSO A DECLARATION, so its absence is not "no news". A `down`
+//! punch DELETES the ConfigMap, which a running pod sees as the file
+//! disappearing — and a client whose port nothing forwards to is worse than a
+//! client that is not running: the tracker keeps pointing downloaders at a hole
+//! that is not there. So:
 //!
-//! Two mapping sources exist, in this order:
+//! * **no mapping at runtime** ⇒ the client is *halted* (`client_suspend`, the
+//!   same primitive the port-change flow already uses), the file is re-read on
+//!   every tick, and the client is re-registered as soon as a mapping is back.
+//!   `decide` is the whole of that state machine, and it is pure.
+//! * **no mapping at startup** ⇒ the process gives up after
+//!   `STARTUP_PUNCH_BUDGET` and exits instead of wedging behind a bound port with
+//!   nothing registered (the tcp probes of a bound listener all pass, so the
+//!   wedge is invisible). The `<name>-punch` mount is required, so a restart is
+//!   gated by the ConfigMap itself; the exit is what makes the state readable.
 //!
-//! 1. the **punch file** (`HATH_PUNCH_FILE`): the `punch.json` the punch
-//!    controller mounts from the `<name>-punch` ConfigMap. This is the source
-//!    the declared punch writes (ADR-0044); the file is re-read every pass, so
-//!    a deleted ConfigMap (punch down) is visible to a running client.
-//! 2. the **natmap HTTP API** (`HATH_NATMAP_API_ENDPOINT`/`HATH_NATMAP_INSTANCE`):
-//!    kept for compatibility with the router package the controller replaces.
+//! While halted, `still_alive` is not sent: the keepalive task checks the shared
+//! `halted` flag. The session is suspended, so the check is either meaningless
+//! or answers `FAIL_NOT_LOGGED_IN`, which shuts the process down — turning a
+//! cheap halt into a restart, the exact thing the halt exists to avoid.
 //!
-//! The file wins when it yields a mapping; otherwise the HTTP source is polled.
-//! A missing or unparsable file is *no mapping from that source this pass*, not
-//! a fatal error: it is logged (rate-limited to a change of state, not every
-//! tick) and the retry loop of the caller handles it.
+//! Every log line here is rate-limited to a change of state, not printed once
+//! per tick: one when the punch file stops yielding a mapping, one when it
+//! starts again, one per halt, one per resume.
 
 use std::{
     collections::HashMap,
     error::Error,
     net::IpAddr,
-    path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::Mutex;
 use reqwest::{
     Client, Proxy,
     header::{CONTENT_TYPE, COOKIE},
 };
 use serde::Deserialize;
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::{
-    metrics::{LABEL_NATMAP_SYNC_APPLIED, LABEL_NATMAP_SYNC_ERROR, LABEL_NATMAP_SYNC_NO_CHANGE, Metrics},
+    metrics::{LABEL_NATMAP_SYNC_APPLIED, LABEL_NATMAP_SYNC_ERROR, LABEL_NATMAP_SYNC_HALTED, LABEL_NATMAP_SYNC_NO_CHANGE, Metrics},
     rpc::RPCClient,
     util::create_http_client,
 };
@@ -54,81 +63,47 @@ use crate::{
 /// sourced at runtime from `RPCClient::id` rather than hardcoded.
 const SETTINGS_URL: &str = "https://e-hentai.org/hentaiathome.php";
 
-/// Initial delay before the first pre-startup retry. Doubles each attempt,
-/// up to `STARTUP_SYNC_MAX`.
-const STARTUP_SYNC_INITIAL: Duration = Duration::from_secs(5);
-/// Upper bound for the pre-startup retry backoff.
-const STARTUP_SYNC_MAX: Duration = Duration::from_secs(300);
+/// First delay before retrying a failed pre-startup pass or a failed resume.
+/// Matches the punch agent's own cadence, so a transient punch outage is
+/// re-tried on the tick after it heals rather than on its own clock.
+const RETRY_INITIAL: Duration = Duration::from_secs(15);
+/// Upper bound for both backoffs.
+const RETRY_MAX: Duration = Duration::from_secs(300);
+/// How long the pre-startup sync waits for the punch file to yield a mapping
+/// before the process gives up and exits.
+const STARTUP_PUNCH_BUDGET: Duration = Duration::from_secs(180);
 
-/// All configuration the port-sync task needs. It is built only when at least
-/// one mapping source is configured; when none is, the task is not spawned and
-/// this feature stays off.
+/// All configuration the port-sync task needs. It is built only when a punch
+/// file is configured; when none is, the task is not spawned and this feature
+/// stays off.
 #[derive(Clone)]
 pub struct NatmapConfig {
     /// Path of the punch file (`punch.json`) written by the punch controller and
-    /// mounted from the `<name>-punch` ConfigMap. Read first on every pass; when
-    /// it is absent or unparsable the HTTP source below is polled instead.
-    pub punch_file: Option<PathBuf>,
-    /// Base URL of the router-side natmap API, e.g. `http://192.168.9.1/natmap`.
-    /// Only a source together with `instance`.
-    pub api_endpoint: Option<String>,
-    /// natmap instance id; its mapping is fetched from `<api_endpoint>/<instance>.json`.
-    pub instance: Option<String>,
+    /// mounted from the `<name>-punch` ConfigMap. The only mapping source: it is
+    /// re-read on every tick, and its absence means the punch is down.
+    pub punch_file: std::path::PathBuf,
     /// Forum cookie `ipb_member_id`, used to authenticate the settings POST.
     pub ipb_member_id: String,
     /// Forum cookie `ipb_pass_hash`, used to authenticate the settings POST.
     pub ipb_pass_hash: String,
-    /// How often to poll the mapping source and reconcile.
+    /// How often to re-read the punch file and reconcile.
     pub poll_interval: Duration,
 }
 
 impl NatmapConfig {
-    /// The natmap HTTP source, when both halves of it are configured. A half
-    /// configured pair is not a source: it cannot be polled.
-    fn http_source(&self) -> Option<(&str, &str)> {
-        match (self.api_endpoint.as_deref(), self.instance.as_deref()) {
-            (Some(endpoint), Some(instance)) => Some((endpoint, instance)),
-            _ => None,
-        }
-    }
-
-    /// The URL the HTTP source polls, when it is configured.
-    fn http_url(&self) -> Option<String> {
-        let (endpoint, instance) = self.http_source()?;
-        Some(format!("{}/{instance}.json", endpoint.trim_end_matches('/')))
-    }
-
     fn punch_file_display(&self) -> String {
-        match &self.punch_file {
-            Some(path) => path.display().to_string(),
-            None => "<unset>".to_string(),
-        }
+        self.punch_file.display().to_string()
     }
 
-    /// Where the mapping is read from, in precedence order, for logs. Says the
-    /// same thing the source selection does, so a log line and the behaviour
-    /// cannot drift apart.
+    /// The mapping source, for logs.
     pub fn source_summary(&self) -> String {
-        match (self.punch_file.is_some(), self.http_url()) {
-            (true, Some(url)) => format!("punch file {} first, then the natmap API {url}", self.punch_file_display()),
-            (true, None) => format!("punch file {}", self.punch_file_display()),
-            (false, Some(url)) => format!("natmap API {url}"),
-            (false, None) => "no mapping source configured".to_string(),
-        }
+        format!("punch file {}", self.punch_file_display())
     }
-}
-
-/// Which source produced a pass's mapping. Logged on change, so a switch
-/// between the file and the HTTP API is visible without a line per tick.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MappingSource {
-    PunchFile,
-    NatmapHttp,
 }
 
 /// Why the punch file produced no mapping this pass. Every variant means the
-/// same thing to the caller ("no mapping from the file"); they differ only in
-/// what the rate-limited warning says.
+/// same thing to the caller ("no mapping"); they differ only in what the
+/// rate-limited warning says and in whether the file is there at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PunchFileProblem {
     Missing,
@@ -141,22 +116,109 @@ impl PunchFileProblem {
         match self {
             PunchFileProblem::Missing => "is absent",
             PunchFileProblem::Unreadable => "could not be read",
-            PunchFileProblem::Malformed => "is not a punch document",
+            PunchFileProblem::Malformed => "is not a punch document for this client",
         }
     }
 }
 
-/// What the last pass logged, so a steady state is quiet: one line when the
-/// source changes, one line when the punch file starts or stops producing a
-/// mapping.
-#[derive(Default)]
-struct SourceLog {
-    source: Option<MappingSource>,
-    file_problem: Option<PunchFileProblem>,
+/// What one pass should do, decided from the mapping and the client's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    /// A mapping is known and the tracker already has that port; keep running.
+    NoChange,
+    /// A mapping is known but the tracker has another port: suspend, update the
+    /// settings page, re-register.
+    UpdatePort,
+    /// A mapping is known, the tracker already has that port, but the client is
+    /// halted: re-register, nothing to change on the settings page.
+    Resume,
+    /// No mapping: suspend the client and report it halted.
+    Suspend,
+    /// No mapping and already halted: nothing to do.
+    StayHalted,
 }
 
-/// A NAT mapping record as published by natmap.
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+/// The halt state machine, in one place. `registered_port` is the port the
+/// tracker currently has on record — `None` when it could not be read, which is
+/// treated as "not equal", i.e. the settings page is rewritten.
+///
+/// A port mismatch outranks the halt: a halted client still needs the tracker's
+/// port corrected before it can be re-registered, and `UpdatePort` skips its own
+/// suspend when the client is already halted.
+fn decide(mapping: Option<&NatmapMapping>, registered_port: Option<u16>, halted: bool) -> Action {
+    match (mapping, halted) {
+        (None, false) => Action::Suspend,
+        (None, true) => Action::StayHalted,
+        (Some(mapping), _) if registered_port != Some(mapping.port) => Action::UpdatePort,
+        (Some(_), true) => Action::Resume,
+        (Some(_), false) => Action::NoChange,
+    }
+}
+
+/// One pass's outcome. The public/external callers act on the halt variants
+/// (the pre-startup loop applies its budget, the background loop just keeps
+/// ticking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassResult {
+    NoChange,
+    Applied,
+    /// The client is (now) halted because the punch yields no mapping.
+    Halted,
+    /// The pass could not complete (tracker unreachable, settings POST rejected).
+    Failed,
+}
+
+/// Pre-startup outcome: distinct from `PassResult` because "no mapping" is the
+/// one failure the startup budget applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrestartupOutcome {
+    Ready,
+    NoMapping,
+    Failed,
+}
+
+/// What the last pass logged, so a steady state is quiet: one line when the
+/// punch file starts or stops producing a mapping.
+#[derive(Default)]
+struct FileLog {
+    problem: Option<PunchFileProblem>,
+}
+
+/// Backoff for re-registering a halted client. A rejected `client_start` (most
+/// likely `FAIL_CONNECT_TEST` while the DNAT has not caught up) must not be
+/// retried every tick: each attempt asks the tracker to run a connectivity test
+/// against us and fail it.
+#[derive(Default)]
+struct ResumeGate {
+    /// The next attempt must not start before this instant.
+    not_before: Option<Instant>,
+    /// The delay used last time; doubles on every failure up to `RETRY_MAX`.
+    delay: Duration,
+}
+
+impl ResumeGate {
+    fn blocked(&self) -> bool {
+        matches!(self.not_before, Some(at) if Instant::now() < at)
+    }
+
+    /// Record a failed attempt and return the delay before the next one.
+    fn failed(&mut self) -> Duration {
+        self.delay = if self.delay.is_zero() {
+            RETRY_INITIAL
+        } else {
+            (self.delay * 2).min(RETRY_MAX)
+        };
+        self.not_before = Some(Instant::now() + self.delay);
+        self.delay
+    }
+
+    fn reset(&mut self) {
+        *self = ResumeGate::default();
+    }
+}
+
+/// A NAT mapping record as published by the punch controller.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct NatmapMapping {
     pub ip: String,
     pub port: u16,
@@ -179,7 +241,7 @@ pub struct HathWebSettings {
 
 impl HathWebSettings {
     /// Build from the `client_settings` key=value map, overriding the port with
-    /// the new external port. Mirrors `load_from_rpc_client_settings` +
+    /// the new public port. Mirrors `load_from_rpc_client_settings` +
     /// `mthbw_cap=0` default from the Python sidecar. Missing fields default to
     /// 0/false so a partial server response cannot abort the update.
     pub fn from_settings_map(map: &HashMap<String, String>, port: u16) -> Self {
@@ -224,32 +286,23 @@ impl HathWebSettings {
     }
 }
 
-/// The long-running port-sync task. Spawn one per process (or none, when the
-/// config is incomplete).
+/// The long-running port-sync task. Spawn one per process (or none, when no
+/// punch file is configured).
 pub struct NatmapSync {
     config: NatmapConfig,
     client: Arc<RPCClient>,
-    /// No-proxy client (LAN natmap API fetch).
-    http: Client,
     /// Proxy-enabled client (e-hentai.org settings POST).
     http_proxy: Client,
     metrics: Arc<Metrics>,
-    /// What was logged last pass — see `SourceLog`.
-    log_state: Mutex<SourceLog>,
-}
-
-/// Outcome of a single reconciliation pass. `reconcile_once` does not call
-/// `client_start` itself — the caller decides whether a re-notify is needed
-/// (the background loop does; the pre-startup sync does not, since
-/// `connect_check` runs next).
-enum ReconcileResult {
-    /// Registered port already matched the external port; nothing changed.
-    NoChange,
-    /// Registered port differed and was updated successfully.
-    Applied,
-    /// The pass did not complete (natmap unreachable, settings fetch failed,
-    /// or the settings POST was rejected). Retryable.
-    Failed,
+    /// The port this client serves content on. A punch must forward to it, so a
+    /// document naming another inner port forwards to nothing and is no mapping.
+    listen_port: u16,
+    /// Shared with the keepalive task: while halted, `still_alive` is not sent.
+    halted: Arc<AtomicBool>,
+    /// Backoff for re-registering a halted client.
+    resume_gate: Mutex<ResumeGate>,
+    /// What was logged last pass — see `FileLog`.
+    file_log: Mutex<FileLog>,
 }
 
 impl NatmapSync {
@@ -259,32 +312,32 @@ impl NatmapSync {
         metrics: Arc<Metrics>,
         proxy: Option<Proxy>,
         local_addr: Option<IpAddr>,
+        listen_port: u16,
+        halted: Arc<AtomicBool>,
     ) -> Self {
-        // Two HTTP clients:
-        //   http       – no proxy, for the LAN-only natmap API fetch.
-        //   http_proxy – with proxy (optional), for the e-hentai.org settings POST.
         if proxy.is_some() {
             info!("natmap: using proxy for e-hentai settings POST");
         }
-        let http = create_http_client(Duration::from_secs(10), None, local_addr);
         let http_proxy = create_http_client(Duration::from_secs(10), proxy, local_addr);
         Self {
             config,
             client,
-            http,
             http_proxy,
             metrics,
-            log_state: Mutex::new(SourceLog::default()),
+            listen_port,
+            halted,
+            resume_gate: Mutex::new(ResumeGate::default()),
+            file_log: Mutex::new(FileLog::default()),
         }
     }
 
     /// Run the poll loop until the RPC client stops running.
     pub async fn run(self) {
         // First tick fires immediately, so a stale port is corrected at startup.
-        let mut interval = interval(self.config.poll_interval);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut ticker = interval(self.config.poll_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            ticker.tick().await;
             if !self.client.is_running() {
                 break;
             }
@@ -292,239 +345,297 @@ impl NatmapSync {
         }
     }
 
-    /// Run reconciliation passes until one succeeds (`NoChange` or `Applied`),
-    /// retrying with exponential backoff. Called before `connect_check` so the
-    /// client comes online with the correct registered port. Never gives up:
-    /// every failure mode is retried. Responds to Ctrl+C during sleep so the
-    /// process can be interrupted during a stalled retry loop.
+    /// Run pre-startup reconciliation passes until one succeeds, retrying with
+    /// exponential backoff. Called before `connect_check` so the client comes
+    /// online with the correct registered port.
     ///
-    /// Returns `true` when the sync completed successfully, `false` if the
-    /// user interrupted with Ctrl+C before it finished.
-    pub async fn sync_until_ready(&self) -> bool {
+    /// "No mapping from the punch file" is the one failure that is bounded
+    /// (`STARTUP_PUNCH_BUDGET`): a client that holds a bound port, never
+    /// registers, and retries forever is invisible from Kubernetes, while
+    /// exiting lets the cluster's own gate — the required `<name>-punch` mount —
+    /// hold the pod until the punch exists. Every other failure (login, settings
+    /// fetch, settings POST) is a network failure a restart cannot fix, so it
+    /// keeps retrying. Responds to Ctrl+C during sleep.
+    pub async fn sync_until_ready(&self) -> Result<(), Box<dyn Error>> {
         info!("natmap: running pre-startup port-sync...");
-        let mut delay = STARTUP_SYNC_INITIAL;
+        let started = Instant::now();
+        let mut delay = RETRY_INITIAL;
         loop {
-            match self.reconcile_once().await {
-                ReconcileResult::NoChange | ReconcileResult::Applied => {
+            let wait = match self.prestartup_once().await {
+                PrestartupOutcome::Ready => {
                     info!("natmap: pre-startup port-sync complete");
-                    return true;
+                    return Ok(());
                 }
-                ReconcileResult::Failed => {
-                    warn!("natmap: pre-startup sync did not complete; retrying in {:?}", delay);
-                    let interrupted = tokio::select! {
-                        _ = sleep(delay) => false,
-                        _ = tokio::signal::ctrl_c() => {
-                            info!("natmap: pre-startup sync interrupted by Ctrl+C");
-                            true
-                        }
-                    };
-                    if interrupted {
-                        return false;
+                PrestartupOutcome::NoMapping => {
+                    let left = STARTUP_PUNCH_BUDGET.saturating_sub(started.elapsed());
+                    if left.is_zero() {
+                        error!(
+                            "natmap: no mapping from {} after {:?}; refusing to start",
+                            self.config.source_summary(),
+                            STARTUP_PUNCH_BUDGET
+                        );
+                        return Err(format!(
+                            "no mapping from {} after {:?}: a punch that yields no mapping cannot be registered",
+                            self.config.source_summary(),
+                            STARTUP_PUNCH_BUDGET
+                        )
+                        .into());
                     }
-                    delay = delay.saturating_mul(2).min(STARTUP_SYNC_MAX);
+                    let wait = delay.min(left);
+                    warn!("natmap: no mapping from {}; retrying in {:?} (giving up in {:?})", self.config.source_summary(), wait, left);
+                    wait
                 }
+                PrestartupOutcome::Failed => {
+                    warn!("natmap: pre-startup sync did not complete; retrying in {delay:?}");
+                    delay
+                }
+            };
+            let interrupted = tokio::select! {
+                _ = sleep(wait) => false,
+                _ = tokio::signal::ctrl_c() => {
+                    info!("natmap: pre-startup sync interrupted by Ctrl+C");
+                    true
+                }
+            };
+            if interrupted {
+                return Err("natmap pre-startup sync interrupted by Ctrl+C".into());
             }
+            delay = (delay * 2).min(RETRY_MAX);
         }
     }
 
-    /// One reconciliation pass. Reads the live NAT mapping and the tracker's
-    /// registered port; if they differ, suspends and updates the settings
-    /// page. Does NOT call `client_start` — the caller decides.
-    async fn reconcile_once(&self) -> ReconcileResult {
-        // 1. Read the live NAT mapping (punch file first, natmap API second).
-        let mapping = match self.fetch_mapping().await {
-            Some(mapping) => mapping,
-            None => {
-                warn!("natmap: no mapping this pass from {}; skipping", self.config.source_summary());
-                self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-                return ReconcileResult::Failed;
-            }
+    /// One pre-startup pass: make the tracker's registered port match the
+    /// punch. Does not re-notify the server (connect_check runs next) and does
+    /// not halt: nothing has registered yet.
+    async fn prestartup_once(&self) -> PrestartupOutcome {
+        let Some(mapping) = self.read_mapping().await else {
+            return PrestartupOutcome::NoMapping;
         };
         self.metrics.natmap_port.set(mapping.port as u64);
 
-        // 2. Read the port the tracker currently has on record.
-        let map = match self.client.fetch_client_settings().await {
-            Some(map) => map,
-            None => {
-                self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-                return ReconcileResult::Failed;
-            }
+        let Some(map) = self.fetch_settings().await else {
+            return PrestartupOutcome::Failed;
         };
         let registered_port = map.get("port").and_then(|v| v.parse::<u16>().ok());
         if let Some(port) = registered_port {
             self.metrics.natmap_registered_port.set(port as u64);
-        } else {
-            warn!("natmap: `port` missing from client_settings response");
         }
-
-        // 3. Equal → nothing to do.
         if registered_port == Some(mapping.port) {
-            info!("natmap: external port {} matches registered port; no change", mapping.port);
+            info!("natmap: public port {} matches registered port; no change", mapping.port);
             self.inc_sync(LABEL_NATMAP_SYNC_NO_CHANGE);
-            return ReconcileResult::NoChange;
+            return PrestartupOutcome::Ready;
         }
-
-        // 4. Differ → suspend, update the settings page.
-        info!(
-            "natmap: external port {} differs from registered port {}; updating",
-            mapping.port,
-            registered_port.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string())
-        );
-        let settings = HathWebSettings::from_settings_map(&map, mapping.port);
-
-        // The settings page rejects changes while the client is active, so the
-        // order is mandatory: suspend first, then POST. Pre-startup this also
-        // clears a stale server-side session from an unclean shutdown.
+        info!("natmap: public port {} differs from registered port {}; updating", mapping.port, display_port(registered_port));
+        // The settings page rejects changes while the client is active. Before
+        // startup this also clears a stale server-side session left by an
+        // unclean shutdown, so it runs unconditionally rather than only for a
+        // known-registered port.
         self.client.suspend().await;
-        if !self.update_port(&settings).await {
-            // POST failed: leave the client suspended and let the caller retry.
-            // The RPC client itself stays alive (is_running is untouched).
+        if !self.update_port(&HathWebSettings::from_settings_map(&map, mapping.port)).await {
             error!("natmap: settings page update failed; will retry");
             self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
-            return ReconcileResult::Failed;
+            return PrestartupOutcome::Failed;
         }
         self.metrics.natmap_registered_port.set(mapping.port as u64);
         self.inc_sync(LABEL_NATMAP_SYNC_APPLIED);
         info!("natmap: registered port updated to {}", mapping.port);
-        ReconcileResult::Applied
+        PrestartupOutcome::Ready
     }
 
-    /// One reconciliation pass followed by a re-notify-start when the port was
-    /// changed. Used by the background poll loop.
+    /// One pass of the background loop. A pass postponed by the resume backoff
+    /// is a halted pass and is counted as one.
     async fn cycle(&self) {
-        if matches!(self.reconcile_once().await, ReconcileResult::Applied) {
-            // We suspended an active client to update its port; bring it back.
-            self.client.client_start().await;
+        if self.resume_gate.lock().blocked() {
+            self.inc_sync(LABEL_NATMAP_SYNC_HALTED);
+            return;
         }
+        self.reconcile_once().await;
     }
 
-    /// The mapping for one pass: the punch file wins, the natmap HTTP API is
-    /// the fallback. `None` when neither source produced a mapping — which the
-    /// caller treats as a failed pass (retried, never fatal).
-    async fn fetch_mapping(&self) -> Option<NatmapMapping> {
-        let file_mapping = match &self.config.punch_file {
-            Some(path) => match self.read_punch_file(path).await {
-                Ok(mapping) => {
-                    self.note_file_problem(None, "");
-                    Some(mapping)
-                }
-                Err((problem, detail)) => {
-                    self.note_file_problem(Some(problem), &detail);
-                    None
-                }
+    /// One reconciliation pass: read the punch file, compare with the port the
+    /// tracker has on record, and run whatever `decide` says.
+    async fn reconcile_once(&self) -> PassResult {
+        let mapping = self.read_mapping().await;
+        if let Some(mapping) = &mapping {
+            self.metrics.natmap_port.set(mapping.port as u64);
+        }
+        // The tracker's settings are only needed when there is a mapping to
+        // compare against — the halt decision does not depend on them, so a
+        // halted client never asks the tracker anything.
+        let settings = match &mapping {
+            Some(_) => match self.fetch_settings().await {
+                Some(map) => Some(map),
+                None => return PassResult::Failed,
             },
             None => None,
         };
-        // Only poll the HTTP source when the file did not answer — the file is
-        // the source of a declared punch, and a fallback that runs anyway would
-        // make a healthy file indistinguishable from a slow one in the logs.
-        let http_mapping = match (file_mapping.is_none(), self.config.http_source()) {
-            (true, Some(_)) => self.fetch_natmap().await,
-            _ => None,
-        };
-        match select_mapping(file_mapping, http_mapping) {
-            Some((mapping, source)) => {
-                self.note_source(source);
-                Some(mapping)
+        let registered_port = settings
+            .as_ref()
+            .and_then(|map| map.get("port").and_then(|v| v.parse::<u16>().ok()));
+        if settings.is_some() {
+            if let Some(port) = registered_port {
+                self.metrics.natmap_registered_port.set(port as u64);
+            } else {
+                warn!("natmap: `port` missing from client_settings response");
             }
-            None => None,
+        }
+
+        let halted = self.is_halted();
+        let action = decide(mapping.as_ref(), registered_port, halted);
+        match action {
+            Action::NoChange => {
+                // Steady state: the counter is the record, a line per tick is not.
+                let port = mapping.map(|m| m.port).unwrap_or_default();
+                debug!("natmap: public port {port} matches registered port; no change");
+                self.inc_sync(LABEL_NATMAP_SYNC_NO_CHANGE);
+                PassResult::NoChange
+            }
+            Action::StayHalted => {
+                // The transition and the file problem were already logged.
+                self.inc_sync(LABEL_NATMAP_SYNC_HALTED);
+                PassResult::Halted
+            }
+            Action::Suspend => {
+                info!("natmap: no mapping from the punch file; halting the client until it returns");
+                self.client.suspend().await;
+                self.set_halted(true);
+                self.inc_sync(LABEL_NATMAP_SYNC_HALTED);
+                PassResult::Halted
+            }
+            Action::UpdatePort => {
+                let mapping = mapping.expect("UpdatePort implies a mapping");
+                let settings = settings.expect("UpdatePort implies tracker settings");
+                info!("natmap: public port {} differs from registered port {}; updating", mapping.port, display_port(registered_port));
+                let web = HathWebSettings::from_settings_map(&settings, mapping.port);
+                // A halted client is already suspended server-side; suspending
+                // again would only log a non-OK answer.
+                if !halted {
+                    self.client.suspend().await;
+                }
+                if !self.update_port(&web).await {
+                    error!("natmap: settings page update failed; will retry");
+                    self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
+                    return PassResult::Failed;
+                }
+                self.metrics.natmap_registered_port.set(mapping.port as u64);
+                self.inc_sync(LABEL_NATMAP_SYNC_APPLIED);
+                info!("natmap: registered port updated to {}", mapping.port);
+                if !self.start_client().await {
+                    return PassResult::Failed;
+                }
+                PassResult::Applied
+            }
+            Action::Resume => {
+                let port = mapping.map(|m| m.port).unwrap_or_default();
+                if !self.start_client().await {
+                    return PassResult::Failed;
+                }
+                info!("natmap: the punch yields a mapping again; client re-registered on port {port}");
+                self.inc_sync(LABEL_NATMAP_SYNC_APPLIED);
+                PassResult::Applied
+            }
         }
     }
 
-    /// Read the punch file and parse it. `Err` is "no mapping from this source
-    /// this pass": the kubelet swaps the ConfigMap file atomically, so a read
-    /// or parse failure means the file is absent or being replaced — never a
+    /// Re-notify the tracker that this client is running. A rejection leaves the
+    /// client halted and schedules the next attempt with backoff.
+    async fn start_client(&self) -> bool {
+        if self.client.client_start().await {
+            self.set_halted(false);
+            self.resume_gate.lock().reset();
+            true
+        } else {
+            self.set_halted(true);
+            let delay = self.resume_gate.lock().failed();
+            warn!("natmap: the tracker did not accept client_start; retrying in {delay:?}");
+            self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
+            false
+        }
+    }
+
+    fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::Relaxed)
+    }
+
+    /// Set the halt flag, exporting the halt as a gauge on the transition only.
+    fn set_halted(&self, halted: bool) {
+        if self.halted.swap(halted, Ordering::Relaxed) != halted {
+            self.metrics.natmap_halted.set(u64::from(halted));
+        }
+    }
+
+    /// The mapping from the punch file, or `None` when it yields none. Sets
+    /// `natmap_punch_file_present` here, at the one place that knows whether the
+    /// file is there.
+    async fn read_mapping(&self) -> Option<NatmapMapping> {
+        match self.read_punch_file().await {
+            Ok(mapping) => {
+                self.metrics.natmap_punch_file_present.set(1);
+                self.note_file_problem(None, "");
+                Some(mapping)
+            }
+            Err((problem, detail)) => {
+                // An unreadable or malformed file is still a file that is there:
+                // the punch exists and something is wrong with it.
+                let present = u64::from(problem != PunchFileProblem::Missing);
+                self.metrics.natmap_punch_file_present.set(present);
+                self.note_file_problem(Some(problem), &detail);
+                None
+            }
+        }
+    }
+
+    /// Read the punch file and parse it. `Err` is "no mapping from it this
+    /// pass": the kubelet swaps the ConfigMap file atomically, so a read or
+    /// parse failure means the file is absent or being replaced — never a
     /// reason to panic, and never a partially-filled mapping (a defaulted port
     /// is a wrong port).
-    async fn read_punch_file(&self, path: &Path) -> Result<NatmapMapping, (PunchFileProblem, String)> {
-        let body = match tokio::fs::read_to_string(path).await {
+    async fn read_punch_file(&self) -> Result<NatmapMapping, (PunchFileProblem, String)> {
+        let body = match tokio::fs::read_to_string(&self.config.punch_file).await {
             Ok(body) => body,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err((PunchFileProblem::Missing, String::new()));
             }
             Err(err) => return Err((PunchFileProblem::Unreadable, err.to_string())),
         };
-        parse_punch_mapping(&body).map_err(|err| (PunchFileProblem::Malformed, err))
+        parse_punch_mapping(&body, self.listen_port).map_err(|err| (PunchFileProblem::Malformed, err))
     }
 
-    /// Log the source a pass used, once per change.
-    fn note_source(&self, source: MappingSource) {
-        let mut state = self.log_state.lock();
-        if state.source == Some(source) {
-            return;
+    /// The tracker's `client_settings` map, or `None` when it could not be read.
+    async fn fetch_settings(&self) -> Option<HashMap<String, String>> {
+        let map = self.client.fetch_client_settings().await;
+        if map.is_none() {
+            self.inc_sync(LABEL_NATMAP_SYNC_ERROR);
         }
-        state.source = Some(source);
-        match source {
-            MappingSource::PunchFile => {
-                info!("natmap: mapping source is the punch file {}", self.config.punch_file_display())
-            }
-            MappingSource::NatmapHttp => {
-                info!("natmap: mapping source is the natmap HTTP API {}", self.config.http_url().unwrap_or_default())
-            }
-        }
+        map
     }
 
     /// Log the punch file not yielding a mapping, once per change of state, and
     /// clear it when the file answers again. `detail` is only used when a
     /// warning is actually emitted.
     fn note_file_problem(&self, problem: Option<PunchFileProblem>, detail: &str) {
-        let mut state = self.log_state.lock();
-        if state.file_problem == problem {
+        let mut state = self.file_log.lock();
+        if state.problem == problem {
             return;
         }
-        state.file_problem = problem;
+        state.problem = problem;
         match problem {
             Some(problem) => {
                 let path = self.config.punch_file_display();
                 if detail.is_empty() {
-                    warn!("natmap: punch file {path} {}; no mapping from it this pass", problem.describe());
+                    warn!("natmap: punch file {path} {}; no mapping from it", problem.describe());
                 } else {
-                    warn!("natmap: punch file {path} {} ({detail}); no mapping from it this pass", problem.describe());
+                    warn!("natmap: punch file {path} {} ({detail}); no mapping from it", problem.describe());
                 }
             }
             None => info!("natmap: punch file {} yields a mapping again", self.config.punch_file_display()),
         }
     }
 
-    /// GET `<api_endpoint>/<instance>.json`. Returns `None` on 404 (instance not
-    /// registered), any transport/parse error, or when the HTTP source is not
-    /// configured (the file-only deployment).
-    async fn fetch_natmap(&self) -> Option<NatmapMapping> {
-        let (endpoint, instance) = self.config.http_source()?;
-        let url = format!("{}/{instance}.json", endpoint.trim_end_matches('/'));
-        let resp = match self.http.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(err) => {
-                warn!("natmap: GET {} failed: {}", url, err);
-                return None;
-            }
-        };
-        if resp.status().as_u16() == 404 {
-            return None;
-        }
-        if let Err(err) = resp.error_for_status_ref() {
-            warn!("natmap: {} returned error status: {}", url, err);
-            return None;
-        }
-        match resp.text().await {
-            Ok(body) => match serde_json::from_str::<NatmapMapping>(&body) {
-                Ok(mapping) => Some(mapping),
-                Err(err) => {
-                    warn!("natmap: failed to parse mapping JSON: {}", err);
-                    None
-                }
-            },
-            Err(err) => {
-                warn!("natmap: failed to read mapping body: {}", err);
-                None
-            }
-        }
-    }
-
     /// POST the new settings to the central settings page, then verify the
     /// change actually applied. Returns false on any failure — including a
     /// HTTP 200 whose re-rendered form still shows the old port — so the
-    /// caller leaves the client suspended for a next-cycle retry. Uses the
+    /// caller leaves the client suspended for a next-pass retry. Uses the
     /// proxy-enabled client since e-hentai.org requires a proxy/VPN from some
     /// networks.
     async fn update_port(&self, settings: &HathWebSettings) -> bool {
@@ -593,6 +704,11 @@ impl NatmapSync {
     }
 }
 
+/// Render the tracker's registered port for a log line; `None` is `?`.
+fn display_port(port: Option<u16>) -> String {
+    port.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string())
+}
+
 /// Extract the value of the `f_port` input from a rendered settings form,
 /// e.g. `<input type="text" name="f_port" value="47362" />` → `47362`.
 /// Returns `None` when the input is missing or its value is not a port —
@@ -606,32 +722,34 @@ fn parse_form_port(body: &str) -> Option<u16> {
     rest[value..end].parse().ok()
 }
 
-/// Pick the mapping for a pass: the punch file wins, the natmap HTTP API is
-/// the fallback, and no data at all is no mapping. Pure, so the precedence is
-/// testable without a filesystem or a network.
-fn select_mapping(file: Option<NatmapMapping>, http: Option<NatmapMapping>) -> Option<(NatmapMapping, MappingSource)> {
-    match (file, http) {
-        (Some(mapping), _) => Some((mapping, MappingSource::PunchFile)),
-        (None, Some(mapping)) => Some((mapping, MappingSource::NatmapHttp)),
-        (None, None) => None,
-    }
-}
-
 /// Parse the punch file's content — natmap's document (`punch.json`), which the
 /// punch controller writes as `{ip, port, inner_port, protocol}`.
 ///
 /// Whitespace-tolerant (a ConfigMap payload usually ends with a newline), but
 /// strict about shape: every field must be present, so a partial document can
-/// never become a mapping with a defaulted port. A document without a usable
-/// public tuple (empty `ip`, `port` 0) is not a mapping either — registering it
-/// would point the tracker at nothing.
-fn parse_punch_mapping(body: &str) -> Result<NatmapMapping, String> {
+/// never become a mapping with a defaulted port. A document that does not
+/// describe a working punch is not a mapping either — registering it would point
+/// the tracker at nothing:
+///
+/// * an empty `ip` or a `port` of 0 is not a public tuple;
+/// * `protocol` must be TCP — the carrier maps TCP and UDP independently, so a
+///   UDP punch would be a second public port no announce can express (ADR-0044);
+/// * `inner_port` must be the port this client serves content on. A document
+///   naming another port describes a redirect to somewhere else, so the port it
+///   announces would never reach us.
+fn parse_punch_mapping(body: &str, listen_port: u16) -> Result<NatmapMapping, String> {
     let mapping: NatmapMapping = serde_json::from_str(body.trim()).map_err(|err| format!("invalid punch document: {err}"))?;
     if mapping.ip.trim().is_empty() {
         return Err("punch document has an empty `ip`".to_string());
     }
     if mapping.port == 0 {
         return Err("punch document has `port` 0".to_string());
+    }
+    if !mapping.protocol.eq_ignore_ascii_case("tcp") {
+        return Err(format!("punch document has protocol {:?}, not tcp", mapping.protocol));
+    }
+    if mapping.inner_port != listen_port {
+        return Err(format!("punch document has inner_port {}, but this client serves on {listen_port}", mapping.inner_port));
     }
     Ok(mapping)
 }
@@ -643,6 +761,19 @@ mod tests {
     fn rpc_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
+
+    fn mapping(port: u16) -> NatmapMapping {
+        NatmapMapping {
+            ip: "120.244.157.23".to_string(),
+            port,
+            inner_port: 44388,
+            protocol: "tcp".to_string(),
+        }
+    }
+
+    /// The document the punch controller writes (compact JSON), which the client
+    /// must read as the same shape natmap's JSON has.
+    const DOCUMENT: &str = r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"tcp"}"#;
 
     #[test]
     fn web_settings_convert_units_and_override_port() {
@@ -754,72 +885,73 @@ mod tests {
         assert_eq!(parse_form_port("<input name=\"f_port\" value=\"abc\" />"), None);
     }
 
-    /// The exact document the punch controller writes (compact JSON, single key
-    /// `punch.json`) — the file source must read the same shape the HTTP source
-    /// does.
-    #[test]
-    fn punch_file_document_parses_into_natmap_mapping() {
-        let body = r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"tcp"}"#;
-        let mapping = parse_punch_mapping(body).expect("controller document must parse");
-        assert_eq!(
-            mapping,
-            NatmapMapping {
-                ip: "120.244.157.23".to_string(),
-                port: 38698,
-                inner_port: 44388,
-                protocol: "tcp".to_string(),
-            }
-        );
-    }
-
     /// A trailing newline (what a ConfigMap mounted file typically carries) and
     /// surrounding whitespace are not part of the document.
     #[test]
     fn punch_file_parsing_trims_surrounding_whitespace() {
         let body = " \n{\"ip\":\"203.0.113.7\",\"port\":27500,\"inner_port\":44388,\"protocol\":\"tcp\"}\n\n";
-        assert_eq!(parse_punch_mapping(body).map(|m| m.port), Ok(27500));
+        assert_eq!(parse_punch_mapping(body, 44388).map(|m| m.port), Ok(27500));
     }
 
-    /// (a) A valid file is preferred over the HTTP source, whatever port the
-    /// HTTP source reports.
     #[test]
-    fn punch_file_is_preferred_over_http() {
-        let file = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"tcp"}"#).ok();
-        let http = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":11111,"inner_port":27257,"protocol":"tcp"}"#).ok();
-        let (mapping, source) = select_mapping(file, http).expect("a mapping is available");
-        assert_eq!(mapping.port, 38698);
-        assert_eq!(source, MappingSource::PunchFile);
+    fn punch_file_document_parses_into_a_mapping() {
+        assert_eq!(parse_punch_mapping(DOCUMENT, 44388), Ok(mapping(38698)));
     }
 
-    /// (b) An absent file is not an error: the HTTP source is used instead.
+    /// Garbage, a truncated write, and a document missing the fields the
+    /// contract requires must all be no mapping — a partial document that
+    /// carried a plausible port is exactly how a wrong port would slip through.
     #[test]
-    fn absent_punch_file_falls_back_to_http() {
-        let http = parse_punch_mapping(r#"{"ip":"120.244.157.23","port":11111,"inner_port":27257,"protocol":"tcp"}"#).ok();
-        let (mapping, source) = select_mapping(None, http).expect("the HTTP source answers");
-        assert_eq!(mapping.port, 11111);
-        assert_eq!(source, MappingSource::NatmapHttp);
-    }
-
-    /// (c) A malformed file is no data: with no HTTP source configured the pass
-    /// has no mapping at all (and is retried), and the port the broken document
-    /// mentions must never reach the tracker.
-    #[test]
-    fn malformed_punch_file_is_no_mapping() {
-        // Garbage, a truncated write, and a document missing the fields the
-        // contract requires (this one carries a plausible port — the exact way
-        // a wrong port would slip through if the parse were lenient).
+    fn broken_punch_documents_are_no_mapping() {
         for body in ["", "{not json", r#"{"ip":"120.244.157.23","port":38698}"#] {
-            let file = parse_punch_mapping(body).ok();
-            assert!(file.is_none(), "{body:?} must not parse into a mapping");
-            assert!(select_mapping(file, None).is_none(), "{body:?} must be no mapping this pass");
+            assert!(parse_punch_mapping(body, 44388).is_err(), "{body:?} must not parse");
         }
     }
 
     /// A document without a usable public tuple is not a mapping: the tracker
     /// would be pointed at nothing.
     #[test]
-    fn punch_file_rejects_empty_ip_and_zero_port() {
-        assert!(parse_punch_mapping(r#"{"ip":"","port":38698,"inner_port":44388,"protocol":"tcp"}"#).is_err());
-        assert!(parse_punch_mapping(r#"{"ip":"120.244.157.23","port":0,"inner_port":44388,"protocol":"tcp"}"#).is_err());
+    fn punch_document_rejects_empty_ip_and_zero_port() {
+        let empty_ip = r#"{"ip":"","port":38698,"inner_port":44388,"protocol":"tcp"}"#;
+        let zero_port = r#"{"ip":"120.244.157.23","port":0,"inner_port":44388,"protocol":"tcp"}"#;
+        assert!(parse_punch_mapping(empty_ip, 44388).is_err());
+        assert!(parse_punch_mapping(zero_port, 44388).is_err());
+    }
+
+    /// Strictness that matters: a punch forwarding to another port announces a
+    /// port that never reaches this client, and a UDP punch is a mapping this
+    /// client cannot serve at all.
+    #[test]
+    fn punch_document_must_describe_this_client() {
+        let other_port = r#"{"ip":"120.244.157.23","port":38698,"inner_port":44389,"protocol":"tcp"}"#;
+        let udp = r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"udp"}"#;
+        assert!(parse_punch_mapping(other_port, 44388).is_err());
+        assert!(parse_punch_mapping(udp, 44388).is_err());
+        // The protocol comparison is case-insensitive: the CRD's enum is
+        // `TCP`, natmap's document is lowercase.
+        assert!(parse_punch_mapping(r#"{"ip":"120.244.157.23","port":38698,"inner_port":44388,"protocol":"TCP"}"#, 44388).is_ok());
+    }
+
+    /// The halt state machine, exhaustively: the port comparison outranks the
+    /// halt, and "no mapping" is the only input that suspends.
+    #[test]
+    fn decide_covers_every_state() {
+        let m = mapping(38698);
+        let cases = [
+            // (mapping, registered, halted, expected)
+            (None, None, false, Action::Suspend),
+            (None, Some(38698), false, Action::Suspend),
+            (None, None, true, Action::StayHalted),
+            (None, Some(38698), true, Action::StayHalted),
+            (Some(&m), Some(38698), false, Action::NoChange),
+            (Some(&m), Some(38698), true, Action::Resume),
+            (Some(&m), Some(11111), false, Action::UpdatePort),
+            (Some(&m), Some(11111), true, Action::UpdatePort),
+            (Some(&m), None, false, Action::UpdatePort),
+            (Some(&m), None, true, Action::UpdatePort),
+        ];
+        for (mapping, registered, halted, expected) in cases {
+            assert_eq!(decide(mapping, registered, halted), expected, "mapping={mapping:?} registered={registered:?} halted={halted}");
+        }
     }
 }

@@ -8,24 +8,29 @@ Read the [Wiki](https://github.com/james58899/hath-rust/wiki/Install)
 
 ## NAT port sync
 hath must tell the H@H tracker which public port it is reachable on, so it runs a port-sync loop
-that re-reads that port and updates the settings page when it changes. The port is read from one of
-two sources:
+that re-reads that port and updates the settings page when it changes. The port comes from one
+source: **a file** — `HATH_PUNCH_FILE` (`--punch-file`), the path of the `punch.json` document a punch
+controller mounts from its ConfigMap, e.g. `/punch/punch.json`. Content is
+`{"ip": "<public ip>", "port": <public port>, "inner_port": <bind port>, "protocol": "tcp"}`, where
+`inner_port` must be the port this client serves on. Without a punch file, port-sync stays off.
 
-1. **a file** — `HATH_PUNCH_FILE` (`--punch-file`), the path of the `punch.json` document a punch
-   controller mounts from its ConfigMap, e.g. `/punch/punch.json`. Content is
-   `{"ip": "<public ip>", "port": <public port>, "inner_port": <bind port>, "protocol": "tcp"}`.
-2. **the natmap HTTP API** — `HATH_NATMAP_API_ENDPOINT` (`--natmap-api-endpoint`, e.g.
-   `http://192.168.9.1/natmap`) plus `HATH_NATMAP_INSTANCE` (`--natmap-instance`), polled at
-   `<endpoint>/<instance>.json`.
+The document is read on every tick (`HATH_NATMAP_POLL_INTERVAL`, default 15s) and must describe a
+working punch: a missing file, unparsable JSON, an empty `ip`, `port: 0`, a protocol other than TCP,
+or an `inner_port` that is not this client's port are all **no mapping** this pass — never a mapping
+with a defaulted field.
 
-The file wins: it is re-read on every tick and is the source a punch controller writes. A missing or
-unparsable file is *no mapping from that source this pass* — logged once per change of state, never
-fatal — and the HTTP source is polled as the fallback when one is configured. With neither source
-configured, port-sync stays off.
+No mapping means the punch is down, so the client is **halted**: `client_suspend` is sent once, the
+file keeps being read, and the client is re-registered as soon as a mapping is back (the settings
+page is updated first if the port changed). While halted, no `still_alive` is sent — the session is
+suspended, and its answer would shut the process down. Before startup, no mapping is bounded: after
+three minutes the process exits, so a client that cannot register is visible instead of idling behind
+a bound port.
 
-Whichever source answers, the rest of the loop is unchanged: `HATH_IPB_MEMBER_ID` and
-`HATH_IPB_PASS_HASH` (`--ipb-member-id`, `--ipb-pass-hash`) authenticate the settings POST, and
-`HATH_NATMAP_POLL_INTERVAL` (`--natmap-poll-interval`, default 60) sets the tick.
+`HATH_IPB_MEMBER_ID` and `HATH_IPB_PASS_HASH` (`--ipb-member-id`, `--ipb-pass-hash`) authenticate the
+settings POST. The halt is exported as `hath_natmap_halted`, the file's presence as
+`hath_natmap_punch_file_present`, and every pass is counted in
+`hath_natmap_sync_total{outcome="applied|no_change|error|halted"}`. The vocabulary is in
+[GLOSSARY.md](GLOSSARY.md).
 
 ## Features
 ### New

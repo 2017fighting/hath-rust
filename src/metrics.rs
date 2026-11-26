@@ -42,6 +42,12 @@ pub struct Metrics {
     pub natmap_port: Gauge<u64, AtomicU64>,
     pub natmap_registered_port: Gauge<u64, AtomicU64>,
     pub natmap_sync_total: Family<NatmapSyncLabels, Counter>,
+    /// 1 while the client is suspended because the punch yields no mapping.
+    pub natmap_halted: Gauge<u64, AtomicU64>,
+    /// 1 while the punch file exists, 0 while it is absent. An unreadable or
+    /// malformed file is still a file that is there — the punch exists and its
+    /// document is wrong.
+    pub natmap_punch_file_present: Gauge<u64, AtomicU64>,
 }
 
 impl Metrics {
@@ -92,9 +98,17 @@ impl Metrics {
         let natmap_port = Gauge::<u64, AtomicU64>::default();
         let natmap_registered_port = Gauge::<u64, AtomicU64>::default();
         let natmap_sync_total = Family::<NatmapSyncLabels, Counter>::default();
-        registry.register("natmap_port", "Last observed external port from natmap", natmap_port.clone());
+        let natmap_halted = Gauge::<u64, AtomicU64>::default();
+        let natmap_punch_file_present = Gauge::<u64, AtomicU64>::default();
+        registry.register("natmap_port", "Last observed public port of the punch", natmap_port.clone());
         registry.register("natmap_registered_port", "Port the tracker currently has on record", natmap_registered_port.clone());
         registry.register("natmap_sync_total", "Number of natmap port-sync cycles by outcome", natmap_sync_total.clone());
+        registry.register("natmap_halted", "1 while the client is suspended because the punch yields no mapping", natmap_halted.clone());
+        registry.register(
+            "natmap_punch_file_present",
+            "1 while the punch file exists (absent means the punch is down)",
+            natmap_punch_file_present.clone(),
+        );
 
         // Uptime
         registry.register_collector(Box::new(Uptime::new()));
@@ -119,6 +133,8 @@ impl Metrics {
             natmap_port,
             natmap_registered_port,
             natmap_sync_total,
+            natmap_halted,
+            natmap_punch_file_present,
         }
     }
 }
@@ -141,12 +157,14 @@ pub struct NatmapSyncLabels {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelValue)]
 pub enum NatmapSyncOutcome {
-    /// Port was changed on the tracker.
+    /// Port was changed on the tracker, or a halted client was re-registered.
     Applied,
     /// Natmap port already matched the registered port; nothing to do.
     NoChange,
     /// The cycle errored before it could apply a change.
     Error,
+    /// The punch yielded no mapping, so the client is halted (or stayed halted).
+    Halted,
 }
 
 pub const LABEL_NATMAP_SYNC_APPLIED: NatmapSyncLabels = NatmapSyncLabels {
@@ -157,6 +175,9 @@ pub const LABEL_NATMAP_SYNC_NO_CHANGE: NatmapSyncLabels = NatmapSyncLabels {
 };
 pub const LABEL_NATMAP_SYNC_ERROR: NatmapSyncLabels = NatmapSyncLabels {
     outcome: NatmapSyncOutcome::Error,
+};
+pub const LABEL_NATMAP_SYNC_HALTED: NatmapSyncLabels = NatmapSyncLabels {
+    outcome: NatmapSyncOutcome::Halted,
 };
 
 #[derive(Debug)]
